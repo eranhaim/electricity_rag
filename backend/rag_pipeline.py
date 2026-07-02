@@ -5,10 +5,7 @@ from pathlib import Path
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
-from langchain.chains import ConversationalRetrievalChain
-from langchain.memory import ConversationBufferWindowMemory
-from langchain.schema import Document
-from langchain.prompts import ChatPromptTemplate, SystemMessagePromptTemplate, HumanMessagePromptTemplate
+from langchain.schema import Document, HumanMessage, AIMessage, SystemMessage
 
 from backend.config import (
     OPENAI_API_KEY, LLM_MODEL, EMBEDDING_MODEL,
@@ -21,34 +18,48 @@ os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
 _vectorstore: FAISS | None = None
 _embeddings: OpenAIEmbeddings | None = None
 
-SYSTEM_PROMPT = """You are an expert assistant for Israeli electricity regulations and standards. You answer questions based ONLY on the provided context documents.
+SYSTEM_PROMPT = """You are a senior expert assistant specializing in Israeli electricity regulations, standards, and electrical safety codes. You answer questions based ONLY on the provided context documents from the knowledge base.
 
-LANGUAGE RULE (HIGHEST PRIORITY — override everything else):
+═══════════════════════════════════════════
+LANGUAGE RULE (HIGHEST PRIORITY)
+═══════════════════════════════════════════
 - Detect the language of the user's CURRENT question (ignore chat history language).
 - If the current question is in Hebrew → answer entirely in Hebrew.
 - If the current question is in English → answer entirely in English.
 - If the current question is in any other language → answer in that language.
 - NEVER mix languages. The context documents may be in Hebrew but you MUST translate/adapt your answer to match the question's language.
 
-ACCURACY RULES:
-- Only use information from the provided context. If the answer is not in the context, say so clearly — never make up information.
-- When referencing specific regulations, standards, or sections, cite them by number/name (e.g., "לפי תקנה 3.2.1" or "According to regulation 3.2.1").
+═══════════════════════════════════════════
+ACCURACY & CITATION RULES
+═══════════════════════════════════════════
+- Only use information explicitly found in the provided context. If the answer is NOT in the context, clearly state: "המידע אינו נמצא במאגר הידע" (Hebrew) or "This information is not available in the knowledge base" (English). NEVER fabricate or guess information.
+- Always cite the specific regulation, standard, section, or clause number when available (e.g., "לפי תקנה 17", "בהתאם לסעיף 3.2.1", "According to IEC 60364-5-54").
+- When multiple regulations are relevant, cite each one separately.
+- Distinguish between mandatory requirements ("חובה", "must") and recommendations ("מומלץ", "should").
 
-FORMATTING RULES — always use Markdown:
-- Use **bold** for key terms, regulation names, and important values.
-- Use bullet points or numbered lists for multiple items or steps.
-- Use headers (##, ###) to organize long answers into sections.
-- When presenting comparative data, specifications, distances, intervals, or any structured data — ALWAYS use a **Markdown table** with proper column headers and alignment.
+═══════════════════════════════════════════
+FORMATTING RULES — ALWAYS use rich Markdown
+═══════════════════════════════════════════
+- Use **bold** for key terms, regulation names, important values, and thresholds.
+- Use bullet points (•) or numbered lists for multiple items, steps, or requirements.
+- Use headers (## and ###) to organize long answers into clear sections.
+- When presenting comparative data, specifications, distances, measurements, intervals, thresholds, or any structured data — ALWAYS use a **Markdown table** with proper column headers:
+  | Column A | Column B | Column C |
+  |----------|----------|----------|
+  | data     | data     | data     |
 - Use > blockquotes for direct quotes from regulations.
-- Keep answers well-structured and easy to scan — avoid long unbroken paragraphs.
+- Keep answers thorough, well-structured, and easy to scan — avoid long unbroken paragraphs.
+- Use horizontal rules (---) to separate major sections when appropriate.
+- If the user explicitly asks for a table, you MUST present the answer as a table.
 
-Context from knowledge base:
-{context}"""
-
-QA_PROMPT = ChatPromptTemplate.from_messages([
-    SystemMessagePromptTemplate.from_template(SYSTEM_PROMPT),
-    HumanMessagePromptTemplate.from_template("{question}"),
-])
+═══════════════════════════════════════════
+ANSWER STRUCTURE
+═══════════════════════════════════════════
+For complex questions, structure your answer as:
+1. Brief direct answer or summary
+2. Detailed explanation with citations
+3. Table or list of specific requirements (if applicable)
+4. Important notes or exceptions (if any)"""
 
 
 def get_embeddings() -> OpenAIEmbeddings:
@@ -103,48 +114,36 @@ def rebuild_vectorstore() -> int:
     return len(chunks)
 
 
-def get_chain(session_messages: list[dict] | None = None):
+async def ask(question: str, session_messages: list[dict] | None = None) -> dict:
     vs = get_vectorstore()
     if vs is None:
-        return None
-
-    llm = ChatOpenAI(model=LLM_MODEL, temperature=0.2, streaming=True)
-    memory = ConversationBufferWindowMemory(
-        k=10,
-        memory_key="chat_history",
-        return_messages=True,
-        output_key="answer",
-    )
-
-    if session_messages:
-        for msg in session_messages[-10:]:
-            if msg["role"] == "user":
-                memory.chat_memory.add_user_message(msg["content"])
-            elif msg["role"] == "assistant":
-                memory.chat_memory.add_ai_message(msg["content"])
-
-    chain = ConversationalRetrievalChain.from_llm(
-        llm=llm,
-        retriever=vs.as_retriever(search_kwargs={"k": 6}),
-        memory=memory,
-        return_source_documents=True,
-        combine_docs_chain_kwargs={"prompt": QA_PROMPT},
-        verbose=False,
-    )
-    return chain
-
-
-async def ask(question: str, session_messages: list[dict] | None = None) -> dict:
-    chain = get_chain(session_messages)
-    if chain is None:
         return {
             "answer": "No knowledge base loaded yet. Please ask an admin to upload documents first.",
             "sources": [],
         }
 
-    result = chain.invoke({"question": question})
-    sources = list({doc.metadata.get("source", "unknown") for doc in result.get("source_documents", [])})
+    retriever = vs.as_retriever(search_kwargs={"k": 7})
+    docs = retriever.invoke(question)
+
+    context = "\n\n---\n\n".join(doc.page_content for doc in docs)
+    sources = list({doc.metadata.get("source", "unknown") for doc in docs})
+
+    messages: list = [SystemMessage(content=SYSTEM_PROMPT)]
+
+    if session_messages:
+        for msg in session_messages[-10:]:
+            if msg["role"] == "user":
+                messages.append(HumanMessage(content=msg["content"]))
+            elif msg["role"] == "assistant":
+                messages.append(AIMessage(content=msg["content"]))
+
+    user_content = f"Context from knowledge base:\n\n{context}\n\n---\n\nQuestion: {question}"
+    messages.append(HumanMessage(content=user_content))
+
+    llm = ChatOpenAI(model=LLM_MODEL, temperature=0.2)
+    response = llm.invoke(messages)
+
     return {
-        "answer": result["answer"],
+        "answer": response.content,
         "sources": sources,
     }
