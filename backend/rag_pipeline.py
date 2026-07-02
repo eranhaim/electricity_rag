@@ -5,7 +5,7 @@ from pathlib import Path
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
-from langchain.schema import Document, HumanMessage, AIMessage, SystemMessage
+from langchain.schema import Document, HumanMessage, SystemMessage
 
 from backend.config import (
     OPENAI_API_KEY, LLM_MODEL, EMBEDDING_MODEL,
@@ -20,42 +20,27 @@ _embeddings: OpenAIEmbeddings | None = None
 
 SYSTEM_PROMPT = """You are a senior expert assistant specializing in Israeli electricity regulations, standards, and electrical safety codes. You answer questions based ONLY on the provided context documents from the knowledge base.
 
-═══════════════════════════════════════════
-LANGUAGE RULE (HIGHEST PRIORITY)
-═══════════════════════════════════════════
-- Detect the language of the user's CURRENT question (ignore chat history language).
-- If the current question is in Hebrew → answer entirely in Hebrew.
-- If the current question is in English → answer entirely in English.
-- If the current question is in any other language → answer in that language.
-- NEVER mix languages. The context documents may be in Hebrew but you MUST translate/adapt your answer to match the question's language.
+LANGUAGE RULE (HIGHEST PRIORITY — MUST FOLLOW):
+- Detect the language of the user's CURRENT question below.
+- If the question is in Hebrew → your ENTIRE answer MUST be in Hebrew.
+- If the question is in English → your ENTIRE answer MUST be in English.
+- NEVER mix languages. Even though the context documents are in Hebrew, if the question is in English you MUST translate all content into English.
 
-═══════════════════════════════════════════
-ACCURACY & CITATION RULES
-═══════════════════════════════════════════
-- Only use information explicitly found in the provided context. If the answer is NOT in the context, clearly state: "המידע אינו נמצא במאגר הידע" (Hebrew) or "This information is not available in the knowledge base" (English). NEVER fabricate or guess information.
-- Always cite the specific regulation, standard, section, or clause number when available (e.g., "לפי תקנה 17", "בהתאם לסעיף 3.2.1", "According to IEC 60364-5-54").
+ACCURACY & CITATION RULES:
+- Only use information explicitly found in the provided context. If the answer is NOT in the context, clearly state that. NEVER fabricate or guess information.
+- Always cite the specific regulation, standard, section, or clause number when available (e.g., "לפי תקנה 17", "According to regulation 17").
 - When multiple regulations are relevant, cite each one separately.
-- Distinguish between mandatory requirements ("חובה", "must") and recommendations ("מומלץ", "should").
 
-═══════════════════════════════════════════
-FORMATTING RULES — ALWAYS use rich Markdown
-═══════════════════════════════════════════
+FORMATTING RULES — ALWAYS use rich Markdown:
 - Use **bold** for key terms, regulation names, important values, and thresholds.
-- Use bullet points (•) or numbered lists for multiple items, steps, or requirements.
+- Use bullet points or numbered lists for multiple items, steps, or requirements.
 - Use headers (## and ###) to organize long answers into clear sections.
-- When presenting comparative data, specifications, distances, measurements, intervals, thresholds, or any structured data — ALWAYS use a **Markdown table** with proper column headers:
-  | Column A | Column B | Column C |
-  |----------|----------|----------|
-  | data     | data     | data     |
+- When presenting comparative data, specifications, distances, measurements, intervals, thresholds, or any structured data — ALWAYS use a Markdown table with proper column headers.
 - Use > blockquotes for direct quotes from regulations.
 - Keep answers thorough, well-structured, and easy to scan — avoid long unbroken paragraphs.
-- Use horizontal rules (---) to separate major sections when appropriate.
 - If the user explicitly asks for a table, you MUST present the answer as a table.
 
-═══════════════════════════════════════════
-ANSWER STRUCTURE
-═══════════════════════════════════════════
-For complex questions, structure your answer as:
+ANSWER STRUCTURE for complex questions:
 1. Brief direct answer or summary
 2. Detailed explanation with citations
 3. Table or list of specific requirements (if applicable)
@@ -114,6 +99,49 @@ def rebuild_vectorstore() -> int:
     return len(chunks)
 
 
+def _detect_language(text: str) -> str:
+    """Simple heuristic: if text contains Hebrew characters, it's Hebrew."""
+    for ch in text:
+        if "\u0590" <= ch <= "\u05FF":
+            return "he"
+    return "en"
+
+
+def _build_messages(
+    question: str,
+    context_docs: list[Document],
+    chat_history: list[dict] | None,
+) -> list:
+    context_text = "\n\n---\n\n".join(doc.page_content for doc in context_docs)
+
+    lang = _detect_language(question)
+    lang_reminder = (
+        "IMPORTANT: The user's question is in ENGLISH. You MUST answer ENTIRELY in English. "
+        "Translate all Hebrew content from the context into English."
+        if lang == "en"
+        else ""
+    )
+
+    system_content = SYSTEM_PROMPT + "\n\nContext from knowledge base:\n" + context_text
+
+    messages = [SystemMessage(content=system_content)]
+
+    if chat_history:
+        for msg in chat_history[-8:]:
+            if msg["role"] == "user":
+                messages.append(HumanMessage(content=msg["content"]))
+            elif msg["role"] == "assistant":
+                from langchain.schema import AIMessage
+                messages.append(AIMessage(content=msg["content"]))
+
+    user_content = question
+    if lang_reminder:
+        user_content = f"{lang_reminder}\n\nQuestion: {question}"
+
+    messages.append(HumanMessage(content=user_content))
+    return messages
+
+
 async def ask(question: str, session_messages: list[dict] | None = None) -> dict:
     vs = get_vectorstore()
     if vs is None:
@@ -122,27 +150,14 @@ async def ask(question: str, session_messages: list[dict] | None = None) -> dict
             "sources": [],
         }
 
-    retriever = vs.as_retriever(search_kwargs={"k": 7})
+    retriever = vs.as_retriever(search_kwargs={"k": 6})
     docs = retriever.invoke(question)
 
-    context = "\n\n---\n\n".join(doc.page_content for doc in docs)
-    sources = list({doc.metadata.get("source", "unknown") for doc in docs})
-
-    messages: list = [SystemMessage(content=SYSTEM_PROMPT)]
-
-    if session_messages:
-        for msg in session_messages[-10:]:
-            if msg["role"] == "user":
-                messages.append(HumanMessage(content=msg["content"]))
-            elif msg["role"] == "assistant":
-                messages.append(AIMessage(content=msg["content"]))
-
-    user_content = f"Context from knowledge base:\n\n{context}\n\n---\n\nQuestion: {question}"
-    messages.append(HumanMessage(content=user_content))
-
     llm = ChatOpenAI(model=LLM_MODEL, temperature=0.2)
-    response = llm.invoke(messages)
+    messages = _build_messages(question, docs, session_messages)
+    response = await llm.ainvoke(messages)
 
+    sources = list({doc.metadata.get("source", "unknown") for doc in docs})
     return {
         "answer": response.content,
         "sources": sources,
