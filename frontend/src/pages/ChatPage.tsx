@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from "react";
 import { useNavigate } from "react-router-dom";
 import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import {
   MessageSquarePlus, Trash2, Send, Zap, Settings, Pencil, Check, X, Menu, ChevronLeft,
 } from "lucide-react";
@@ -204,7 +205,7 @@ export default function ChatPage() {
                     {m.role === "user" ? "U" : <Zap size={16} />}
                   </div>
                   <div className={styles.messageBubble}>
-                    <ReactMarkdown>{m.content}</ReactMarkdown>
+                    <ReactMarkdown remarkPlugins={[remarkGfm]}>{m.content}</ReactMarkdown>
                   </div>
                 </div>
               ))}

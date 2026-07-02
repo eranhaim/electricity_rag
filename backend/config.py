@@ -16,8 +16,8 @@ ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")
 LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o")
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
 
-CHUNK_SIZE = 1000
-CHUNK_OVERLAP = 200
+CHUNK_SIZE = 1500
+CHUNK_OVERLAP = 300
 
 for d in [UPLOADS_DIR, PROCESSED_DIR, VECTORSTORE_DIR]:
     d.mkdir(parents=True, exist_ok=True)

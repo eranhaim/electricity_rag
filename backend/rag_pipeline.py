@@ -8,6 +8,7 @@ from langchain_community.vectorstores import FAISS
 from langchain.chains import ConversationalRetrievalChain
 from langchain.memory import ConversationBufferWindowMemory
 from langchain.schema import Document
+from langchain.prompts import ChatPromptTemplate, SystemMessagePromptTemplate, HumanMessagePromptTemplate
 
 from backend.config import (
     OPENAI_API_KEY, LLM_MODEL, EMBEDDING_MODEL,
@@ -19,6 +20,29 @@ os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
 
 _vectorstore: FAISS | None = None
 _embeddings: OpenAIEmbeddings | None = None
+
+SYSTEM_PROMPT = """You are an expert assistant for Israeli electricity regulations and standards. You answer questions based ONLY on the provided context documents.
+
+CRITICAL RULES:
+1. **Language**: Always reply in the SAME language the user asked in. Hebrew question = Hebrew answer. English question = English answer.
+2. **Accuracy**: Only use information from the provided context. If the answer is not in the context, say so clearly — never make up information.
+3. **Citations**: When referencing specific regulations, standards, or sections, cite them by number/name (e.g., "לפי תקנה 3.2.1" or "According to regulation 3.2.1").
+
+FORMATTING RULES — use Markdown:
+- Use **bold** for key terms, regulation names, and important values.
+- Use bullet points or numbered lists for multiple items or steps.
+- Use headers (##, ###) to organize long answers into sections.
+- When presenting comparative data, specifications, distances, intervals, or any structured data — use a **Markdown table** with proper headers.
+- Use > blockquotes for direct quotes from regulations.
+- Keep answers well-structured and easy to scan — avoid long unbroken paragraphs.
+
+Context from knowledge base:
+{context}"""
+
+QA_PROMPT = ChatPromptTemplate.from_messages([
+    SystemMessagePromptTemplate.from_template(SYSTEM_PROMPT),
+    HumanMessagePromptTemplate.from_template("{question}"),
+])
 
 
 def get_embeddings() -> OpenAIEmbeddings:
@@ -78,7 +102,7 @@ def get_chain(session_messages: list[dict] | None = None):
     if vs is None:
         return None
 
-    llm = ChatOpenAI(model=LLM_MODEL, temperature=0.3, streaming=True)
+    llm = ChatOpenAI(model=LLM_MODEL, temperature=0.2, streaming=True)
     memory = ConversationBufferWindowMemory(
         k=10,
         memory_key="chat_history",
@@ -95,9 +119,10 @@ def get_chain(session_messages: list[dict] | None = None):
 
     chain = ConversationalRetrievalChain.from_llm(
         llm=llm,
-        retriever=vs.as_retriever(search_kwargs={"k": 5}),
+        retriever=vs.as_retriever(search_kwargs={"k": 6}),
         memory=memory,
         return_source_documents=True,
+        combine_docs_chain_kwargs={"prompt": QA_PROMPT},
         verbose=False,
     )
     return chain
