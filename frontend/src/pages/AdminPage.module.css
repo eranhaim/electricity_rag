@@ -20,6 +20,7 @@
   flex-direction: column;
   align-items: center;
   gap: 12px;
+  position: relative;
 }
 
 .loginIcon {
@@ -122,6 +123,45 @@
   background: var(--bg-secondary);
 }
 
+.langBtn {
+  padding: 4px 10px;
+  border-radius: 6px;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--text-secondary);
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border);
+  transition: background 0.12s, color 0.12s;
+  letter-spacing: 0.3px;
+  line-height: 1.4;
+}
+
+.langBtn:hover {
+  background: var(--bg-active);
+  color: var(--text-primary);
+}
+
+.langBtnFloat {
+  position: absolute;
+  top: 12px;
+  inset-inline-end: 12px;
+  padding: 4px 10px;
+  border-radius: 6px;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--text-secondary);
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border);
+  transition: background 0.12s, color 0.12s;
+  letter-spacing: 0.3px;
+  line-height: 1.4;
+}
+
+.langBtnFloat:hover {
+  background: var(--bg-active);
+  color: var(--text-primary);
+}
+
 .header h1 {
   display: flex;
   align-items: center;
@@ -129,6 +169,7 @@
   font-size: 18px;
   font-weight: 600;
   color: var(--accent);
+  flex: 1;
 }
 
 .backBtn {

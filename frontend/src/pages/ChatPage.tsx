@@ -8,10 +8,12 @@ import {
   fetchSessions, createSession, fetchSession, deleteSession,
   renameSession, sendMessage, Session, Message,
 } from "../api";
+import { useI18n } from "../i18n";
 import styles from "./ChatPage.module.css";
 
 export default function ChatPage() {
   const navigate = useNavigate();
+  const { t, toggleLocale } = useI18n();
   const [sessions, setSessions] = useState<Session[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
@@ -93,7 +95,7 @@ export default function ChatPage() {
         );
       }
     } catch {
-      const errMsg: Message = { role: "assistant", content: "Sorry, something went wrong. Please try again.", timestamp: new Date().toISOString() };
+      const errMsg: Message = { role: "assistant", content: t.errorMessage, timestamp: new Date().toISOString() };
       setMessages((prev) => [...prev, errMsg]);
     } finally {
       setLoading(false);
@@ -114,16 +116,21 @@ export default function ChatPage() {
         <div className={styles.sidebarHeader}>
           <div className={styles.logo}>
             <Zap size={20} />
-            <span>Electricity RAG</span>
+            <span>{t.appName}</span>
           </div>
-          <button className={styles.iconBtn} onClick={() => setSidebarOpen(false)} title="Close sidebar">
-            <ChevronLeft size={18} />
-          </button>
+          <div className={styles.headerActions}>
+            <button className={styles.langBtn} onClick={toggleLocale} title="Switch language">
+              {t.langToggle}
+            </button>
+            <button className={styles.iconBtn} onClick={() => setSidebarOpen(false)} title={t.closeSidebar}>
+              <ChevronLeft size={18} />
+            </button>
+          </div>
         </div>
 
         <button className={styles.newChatBtn} onClick={handleNewChat}>
           <MessageSquarePlus size={18} />
-          <span>New Chat</span>
+          <span>{t.newChat}</span>
         </button>
 
         <div className={styles.sessionList}>
@@ -170,7 +177,7 @@ export default function ChatPage() {
 
         <button className={styles.adminLink} onClick={() => navigate("/admin")}>
           <Settings size={16} />
-          <span>Admin Panel</span>
+          <span>{t.adminPanel}</span>
         </button>
       </aside>
 
@@ -186,8 +193,8 @@ export default function ChatPage() {
           {messages.length === 0 && !loading ? (
             <div className={styles.emptyState}>
               <Zap size={48} className={styles.emptyIcon} />
-              <h2>Electricity Knowledge Assistant</h2>
-              <p>Ask me anything about electricity, power systems, regulations, and more.</p>
+              <h2>{t.emptyTitle}</h2>
+              <p>{t.emptyDescription}</p>
             </div>
           ) : (
             <div className={styles.messages}>
@@ -224,7 +231,7 @@ export default function ChatPage() {
               value={input}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={handleKeyDown}
-              placeholder="Ask about electricity..."
+              placeholder={t.inputPlaceholder}
               rows={1}
               disabled={loading}
             />
@@ -237,7 +244,7 @@ export default function ChatPage() {
             </button>
           </div>
           <p className={styles.disclaimer}>
-            Answers are based on uploaded electricity documents. Always verify critical information.
+            {t.disclaimer}
           </p>
         </div>
       </main>

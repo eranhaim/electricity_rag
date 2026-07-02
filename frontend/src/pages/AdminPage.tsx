@@ -6,10 +6,12 @@ import {
 import {
   adminLogin, adminListFiles, adminUploadFile, adminDeleteFile, adminStatus, UploadedFile,
 } from "../api";
+import { useI18n } from "../i18n";
 import styles from "./AdminPage.module.css";
 
 export default function AdminPage() {
   const navigate = useNavigate();
+  const { t, toggleLocale } = useI18n();
   const [password, setPassword] = useState("");
   const [authenticated, setAuthenticated] = useState(false);
   const [authError, setAuthError] = useState(false);
@@ -65,14 +67,14 @@ export default function AdminPage() {
       const result = await adminUploadFile(password, file);
       setUploadStatus({
         type: "success",
-        message: `"${result.filename}" processed successfully. ${result.chunks_indexed} chunks indexed.`,
+        message: t.uploadSuccess(result.filename, result.chunks_indexed),
       });
       loadFiles();
       loadStatus();
     } catch (err: any) {
       setUploadStatus({
         type: "error",
-        message: err.message || "Upload failed",
+        message: err.message || t.uploadFailed,
       });
     } finally {
       setUploading(false);
@@ -81,7 +83,7 @@ export default function AdminPage() {
   }
 
   async function handleDelete(filename: string) {
-    if (!confirm(`Delete "${filename}" and rebuild the knowledge base?`)) return;
+    if (!confirm(t.deleteConfirm(filename))) return;
     await adminDeleteFile(password, filename);
     loadFiles();
     loadStatus();
@@ -97,32 +99,35 @@ export default function AdminPage() {
     return (
       <div className={styles.loginPage}>
         <div className={styles.loginCard}>
+          <button className={styles.langBtnFloat} onClick={toggleLocale} title="Switch language">
+            {t.langToggle}
+          </button>
           <div className={styles.loginIcon}>
             <Lock size={32} />
           </div>
-          <h2>Admin Access</h2>
-          <p>Enter the admin password to manage documents.</p>
+          <h2>{t.adminAccess}</h2>
+          <p>{t.enterPassword}</p>
           <div className={styles.loginForm}>
             <input
               type="password"
               className={styles.passwordInput}
-              placeholder="Password"
+              placeholder={t.password}
               value={password}
               onChange={(e) => { setPassword(e.target.value); setAuthError(false); }}
               onKeyDown={(e) => e.key === "Enter" && handleLogin()}
               autoFocus
             />
             <button className={styles.loginBtn} onClick={handleLogin}>
-              Sign In
+              {t.signIn}
             </button>
           </div>
           {authError && (
             <div className={styles.authError}>
-              <AlertCircle size={14} /> Incorrect password
+              <AlertCircle size={14} /> {t.incorrectPassword}
             </div>
           )}
           <button className={styles.backLink} onClick={() => navigate("/")}>
-            <ArrowLeft size={14} /> Back to chat
+            <ArrowLeft size={14} /> {t.backToChat}
           </button>
         </div>
       </div>
@@ -134,12 +139,15 @@ export default function AdminPage() {
       <header className={styles.header}>
         <button className={styles.backBtn} onClick={() => navigate("/")}>
           <ArrowLeft size={18} />
-          <span>Back to Chat</span>
+          <span>{t.backToChat}</span>
         </button>
         <h1>
           <Zap size={22} />
-          Admin Panel
+          {t.adminPanelTitle}
         </h1>
+        <button className={styles.langBtn} onClick={toggleLocale} title="Switch language">
+          {t.langToggle}
+        </button>
       </header>
 
       <div className={styles.content}>
@@ -148,12 +156,12 @@ export default function AdminPage() {
           <div className={styles.statusCard}>
             <Database size={20} />
             <div>
-              <div className={styles.statusLabel}>Vector Store</div>
+              <div className={styles.statusLabel}>{t.vectorStore}</div>
               <div className={styles.statusValue}>
                 {status?.vectorstore_loaded ? (
-                  <span className={styles.statusActive}><CheckCircle2 size={14} /> Active</span>
+                  <span className={styles.statusActive}><CheckCircle2 size={14} /> {t.active}</span>
                 ) : (
-                  <span className={styles.statusInactive}><AlertCircle size={14} /> Empty</span>
+                  <span className={styles.statusInactive}><AlertCircle size={14} /> {t.empty}</span>
                 )}
               </div>
             </div>
@@ -161,18 +169,17 @@ export default function AdminPage() {
           <div className={styles.statusCard}>
             <FileText size={20} />
             <div>
-              <div className={styles.statusLabel}>Documents</div>
-              <div className={styles.statusValue}>{status?.upload_count ?? 0} files</div>
+              <div className={styles.statusLabel}>{t.documents}</div>
+              <div className={styles.statusValue}>{status?.upload_count ?? 0} {t.files}</div>
             </div>
           </div>
         </div>
 
         {/* Upload section */}
         <div className={styles.section}>
-          <h2>Upload Documents</h2>
+          <h2>{t.uploadDocuments}</h2>
           <p className={styles.sectionDesc}>
-            Upload PDF, DOCX, TXT, XLSX, or CSV files. Each file will be processed by an LLM
-            to create an optimized knowledge base document, then indexed for retrieval.
+            {t.uploadDescription}
           </p>
 
           <div
@@ -182,12 +189,12 @@ export default function AdminPage() {
             {uploading ? (
               <>
                 <Loader2 size={32} className={styles.spinner} />
-                <span>Processing file with LLM... This may take a minute.</span>
+                <span>{t.processingFile}</span>
               </>
             ) : (
               <>
                 <Upload size={32} />
-                <span>Click to select a file</span>
+                <span>{t.clickToSelect}</span>
                 <span className={styles.dropHint}>PDF, DOCX, TXT, XLSX, CSV</span>
               </>
             )}
@@ -210,9 +217,9 @@ export default function AdminPage() {
 
         {/* File list */}
         <div className={styles.section}>
-          <h2>Uploaded Files</h2>
+          <h2>{t.uploadedFiles}</h2>
           {files.length === 0 ? (
-            <p className={styles.emptyText}>No files uploaded yet.</p>
+            <p className={styles.emptyText}>{t.noFiles}</p>
           ) : (
             <div className={styles.fileList}>
               {files.map((f) => (
