@@ -117,46 +117,123 @@ def _count_pages(pdf_path: Path) -> int:
 _CODE_FENCE_RE = re.compile(r"^\s*```(?:markdown|md)?\s*\n?|\n?```\s*$", re.IGNORECASE)
 
 
+def _collapse_repeated_lines(text: str) -> str:
+    """Collapse runs of 3+ consecutive identical (non-blank) lines to a
+    single occurrence. Catches "1. Xxxx / 2. Xxxx / 3. Xxxx / ..." style
+    hallucinations where each numbered line has the same body."""
+    out: list[str] = []
+    prev_stripped: str | None = None
+    run = 0
+    for line in text.splitlines():
+        s = line.strip()
+        if s and s == prev_stripped:
+            run += 1
+            if run < 3:
+                out.append(line)
+        else:
+            out.append(line)
+            prev_stripped = s
+            run = 1
+    return "\n".join(out)
+
+
 def _clean_model_output(markdown: str) -> str:
     """Post-process model output:
-      * Strip stray leading/trailing ```markdown code fences that the model
-        sometimes adds despite the prompt instruction not to.
-      * Collapse absurd repetitions ("שבין הכבל, שבין הכבל, שבין הכבל, ...")
-        which are a known GPT failure mode. If the same short phrase repeats
-        more than 5 times consecutively, keep only the first occurrence.
+      * Strip stray leading/trailing ```markdown code fences.
+      * Collapse absurd repetitions (both short phrases and full lines).
+      * Collapse "N. body" patterns where the body is identical across
+        many numbered items — a strong signal of hallucination.
     """
     md = markdown.strip()
     md = _CODE_FENCE_RE.sub("", md).strip()
 
-    # Detect and shrink runaway repetitions of a short phrase (3-30 chars).
-    for phrase_len in range(3, 31):
-        pattern = re.compile(r"(.{" + str(phrase_len) + r"})\1{5,}")
+    md = _collapse_repeated_lines(md)
+
+    # Substring repetition — extend up to 200 chars so we catch sentence-
+    # length repeated phrases (a known gpt-4o failure mode on Hebrew pages).
+    for phrase_len in range(3, 201):
+        pattern = re.compile(r"(.{" + str(phrase_len) + r"})\1{2,}", re.DOTALL)
         md = pattern.sub(r"\1", md)
 
-    return md
+    # Collapse "N. same_body" runs of 5+ enumerated lines whose bodies match.
+    lines = md.split("\n")
+    enum_re = re.compile(r"^\s*\d+[.)]\s+(.*)$")
+    kept: list[str] = []
+    i = 0
+    while i < len(lines):
+        m = enum_re.match(lines[i])
+        if not m:
+            kept.append(lines[i])
+            i += 1
+            continue
+        body = m.group(1).strip()
+        end = i
+        while end + 1 < len(lines):
+            nm = enum_re.match(lines[end + 1])
+            if nm and nm.group(1).strip() == body:
+                end += 1
+            else:
+                break
+        if end - i >= 4:
+            kept.append(lines[i])
+            i = end + 1
+        else:
+            kept.append(lines[i])
+            i += 1
+    return "\n".join(kept)
+
+
+def _looks_pathological(markdown: str) -> bool:
+    """True if the output is very likely a runaway hallucination:
+    the same non-trivial line appears 5+ times, OR > 60 % of length is a
+    single repeated substring. Used to trigger a retry with different
+    sampling temperature."""
+    if not markdown:
+        return False
+    lines = [ln.strip() for ln in markdown.splitlines() if ln.strip()]
+    if not lines:
+        return False
+    counts: dict[str, int] = {}
+    for ln in lines:
+        if len(ln) >= 25:
+            counts[ln] = counts.get(ln, 0) + 1
+    if any(c >= 5 for c in counts.values()):
+        return True
+    total = len(markdown)
+    for phrase_len in (60, 120):
+        m = re.search(
+            r"(.{" + str(phrase_len) + r"})\1{4,}",
+            markdown,
+            flags=re.DOTALL,
+        )
+        if m and (len(m.group(0))) / total > 0.6:
+            return True
+    return False
 
 
 def _looks_valid(markdown: str) -> bool:
-    """Very light sanity check on model output: non-empty, no obvious refusal.
-    We accept short output (blank pages produce short output legitimately)."""
+    """Sanity check: non-empty, no refusal, not a pathological hallucination.
+    Blank/short pages are OK (some pages really are near-empty)."""
     if markdown is None:
         return False
     md = markdown.strip()
     lower = md.lower()
     if any(x in lower for x in ("i can't", "i cannot", "sorry, i", "as an ai")):
         return False
+    if _looks_pathological(md):
+        return False
     return True
 
 
 async def _extract_page(
-    llm: ChatOpenAI,
     pdf_path: Path,
     page_num: int,
     sem: asyncio.Semaphore,
 ) -> PageResult:
     cache_path = _cache_file(pdf_path, page_num)
     if cache_path.exists():
-        return PageResult(page_num, cache_path.read_text(encoding="utf-8"), True)
+        cached = cache_path.read_text(encoding="utf-8")
+        return PageResult(page_num, cached, True)
 
     png_bytes = await asyncio.to_thread(_render_page_png, pdf_path, page_num)
     b64 = base64.b64encode(png_bytes).decode("ascii")
@@ -171,20 +248,32 @@ async def _extract_page(
                     "the attached PDF page image, following ALL rules above."
                 ),
             },
-            {"type": "image_url", "image_url": {"url": data_url}},
+            {"type": "image_url", "image_url": {"url": data_url, "detail": "high"}},
         ]
     )
 
     async with sem:
         last_err: Exception | None = None
-        for attempt in range(3):
+        # On each retry raise the temperature so a stuck repetition loop
+        # gets a chance to sample different tokens next time.
+        for attempt, temperature in enumerate([0.0, 0.3, 0.7]):
             try:
-                resp = await llm.ainvoke([SystemMessage(content=SYSTEM_PROMPT), user_msg])
+                llm = ChatOpenAI(
+                    model=VISION_MODEL,
+                    temperature=temperature,
+                    max_tokens=4096,
+                )
+                resp = await llm.ainvoke([
+                    SystemMessage(content=SYSTEM_PROMPT),
+                    user_msg,
+                ])
                 md = _clean_model_output(resp.content or "")
                 if _looks_valid(md):
                     cache_path.write_text(md, encoding="utf-8")
                     return PageResult(page_num, md, False)
-                last_err = RuntimeError("invalid response text")
+                last_err = RuntimeError(
+                    f"invalid response at attempt {attempt + 1} (temp={temperature})"
+                )
             except Exception as e:  # noqa: BLE001
                 last_err = e
             await asyncio.sleep(1.5 * (attempt + 1))
@@ -207,11 +296,10 @@ async def convert_pdf_to_markdown(
     chunk. Cached per-page — subsequent calls are fast.
     """
     total = _count_pages(pdf_path)
-    llm = ChatOpenAI(model=VISION_MODEL, temperature=0.0, max_tokens=4096)
     sem = asyncio.Semaphore(CONCURRENCY)
 
     tasks = [
-        asyncio.create_task(_extract_page(llm, pdf_path, p, sem))
+        asyncio.create_task(_extract_page(pdf_path, p, sem))
         for p in range(1, total + 1)
     ]
 
