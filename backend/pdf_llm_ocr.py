@@ -114,6 +114,28 @@ def _count_pages(pdf_path: Path) -> int:
         doc.close()
 
 
+_CODE_FENCE_RE = re.compile(r"^\s*```(?:markdown|md)?\s*\n?|\n?```\s*$", re.IGNORECASE)
+
+
+def _clean_model_output(markdown: str) -> str:
+    """Post-process model output:
+      * Strip stray leading/trailing ```markdown code fences that the model
+        sometimes adds despite the prompt instruction not to.
+      * Collapse absurd repetitions ("שבין הכבל, שבין הכבל, שבין הכבל, ...")
+        which are a known GPT failure mode. If the same short phrase repeats
+        more than 5 times consecutively, keep only the first occurrence.
+    """
+    md = markdown.strip()
+    md = _CODE_FENCE_RE.sub("", md).strip()
+
+    # Detect and shrink runaway repetitions of a short phrase (3-30 chars).
+    for phrase_len in range(3, 31):
+        pattern = re.compile(r"(.{" + str(phrase_len) + r"})\1{5,}")
+        md = pattern.sub(r"\1", md)
+
+    return md
+
+
 def _looks_valid(markdown: str) -> bool:
     """Very light sanity check on model output: non-empty, no obvious refusal.
     We accept short output (blank pages produce short output legitimately)."""
@@ -158,7 +180,7 @@ async def _extract_page(
         for attempt in range(3):
             try:
                 resp = await llm.ainvoke([SystemMessage(content=SYSTEM_PROMPT), user_msg])
-                md = (resp.content or "").strip()
+                md = _clean_model_output(resp.content or "")
                 if _looks_valid(md):
                     cache_path.write_text(md, encoding="utf-8")
                     return PageResult(page_num, md, False)
