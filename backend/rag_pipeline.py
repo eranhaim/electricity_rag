@@ -37,6 +37,8 @@ from langchain.text_splitter import (
     RecursiveCharacterTextSplitter,
 )
 from langchain_community.vectorstores import FAISS
+from langchain_community.retrievers import BM25Retriever
+from langchain.retrievers import EnsembleRetriever
 from langchain.schema import AIMessage, Document, HumanMessage, SystemMessage
 
 from backend.config import (
@@ -54,6 +56,12 @@ os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
 
 _vectorstore: FAISS | None = None
 _embeddings: OpenAIEmbeddings | None = None
+# Keep the raw chunks in memory alongside the FAISS index so we can build a
+# BM25 keyword retriever without re-parsing the PDF on every query. Hebrew
+# legal questions frequently rely on exact terms (e.g. "תיבה" vs "קופסה")
+# that vector similarity alone under-recalls.
+_chunks: list[Document] = []
+_bm25: BM25Retriever | None = None
 
 SYSTEM_PROMPT = """You are a senior expert assistant specializing in Israeli electricity regulations, standards, and electrical safety codes ("תקנות החשמל"). You answer questions based ONLY on the provided context documents from the knowledge base.
 
@@ -64,9 +72,11 @@ LANGUAGE RULE (HIGHEST PRIORITY — MUST FOLLOW):
 - NEVER mix languages in a single answer.
 
 ACCURACY & CITATION RULES:
-- Use ONLY information explicitly present in the provided context. If the answer is not in the context, say so clearly ("המידע לא נמצא במאגר הידע" / "This information is not in the knowledge base"). NEVER invent regulation numbers, values, or facts.
-- ALWAYS cite the specific regulation / section / clause when it appears in the context (e.g., "לפי תקנה 17", "according to regulation 17").
-- Take citations from the [section:] header path shown at the top of each chunk in the context, and from the source filename shown in [source:].
+- Use ONLY information explicitly present in the provided context. NEVER invent regulation numbers, values, or facts.
+- Read the ENTIRE context carefully before concluding "not found". The context may be fragmented (e.g. RTL Hebrew PDF extraction can produce jumbled word order); if any chunk contains information that plausibly answers the question, USE IT and cite that chunk. Do not require an exact keyword match.
+- ONLY refuse ("המידע לא נמצא במאגר הידע" / "This information is not in the knowledge base") when the context truly contains no relevant material. When you refuse, briefly say which related topics DID appear in the context so the user can rephrase.
+- ALWAYS cite the specific regulation / section / clause when it appears in the context (e.g., "לפי תקנה 17", "according to regulation 17"). Regulation numbers usually appear at the start of a paragraph in the Hebrew text.
+- Take citations from any [section:] header shown at the top of the chunk, and from the source filename shown in [source:] plus the [page:] number when present.
 - If a fact spans multiple regulations, cite each one.
 - Preserve exact numeric values, units, and thresholds from the source. Do not round or paraphrase numbers.
 
@@ -100,9 +110,11 @@ def get_embeddings() -> OpenAIEmbeddings:
 
 
 def get_vectorstore(force_reload: bool = False) -> FAISS | None:
-    global _vectorstore
+    global _vectorstore, _chunks, _bm25
     if force_reload:
         _vectorstore = None
+        _chunks = []
+        _bm25 = None
     if _vectorstore is not None:
         return _vectorstore
     index_path = VECTORSTORE_DIR / "index.faiss"
@@ -112,21 +124,28 @@ def get_vectorstore(force_reload: bool = False) -> FAISS | None:
             get_embeddings(),
             allow_dangerous_deserialization=True,
         )
+        # Rehydrate the in-memory chunk list from the FAISS docstore so BM25
+        # can index the same corpus on next query without a full reprocess.
+        try:
+            _chunks = list(_vectorstore.docstore._dict.values())  # type: ignore[attr-defined]
+            _bm25 = _build_bm25(_chunks) if _chunks else None
+        except Exception:  # noqa: BLE001
+            _chunks = []
+            _bm25 = None
     return _vectorstore
 
 
 def rebuild_vectorstore() -> int:
-    """Rebuild the FAISS index from every file currently in ``data/uploads``.
+    """Rebuild the FAISS index (and in-memory BM25 corpus) from every file
+    currently in ``data/uploads``.
 
     Loads raw Documents (with source + page metadata) directly via
-    ``load_file_documents`` — the ``data/processed/*.txt`` artifacts are only
-    for human debugging and are NOT used for retrieval. This is the fix that
-    prevents the previous "LLM-optimized" corrupted text from ever entering
-    the index again.
+    ``load_file_documents`` — the ``data/processed/*.md``/``.txt`` artifacts
+    are only for human debugging and are NOT used for retrieval.
 
     Returns the number of chunks indexed.
     """
-    global _vectorstore
+    global _vectorstore, _chunks, _bm25
 
     upload_files = [
         f for f in UPLOADS_DIR.iterdir()
@@ -135,6 +154,8 @@ def rebuild_vectorstore() -> int:
 
     if not upload_files:
         _vectorstore = None
+        _chunks = []
+        _bm25 = None
         for stale in VECTORSTORE_DIR.glob("index.*"):
             stale.unlink(missing_ok=True)
         return 0
@@ -148,6 +169,8 @@ def rebuild_vectorstore() -> int:
 
     if not documents:
         _vectorstore = None
+        _chunks = []
+        _bm25 = None
         for stale in VECTORSTORE_DIR.glob("index.*"):
             stale.unlink(missing_ok=True)
         return 0
@@ -163,7 +186,21 @@ def rebuild_vectorstore() -> int:
 
     _vectorstore = FAISS.from_documents(chunks, get_embeddings())
     _vectorstore.save_local(str(VECTORSTORE_DIR))
+
+    _chunks = chunks
+    _bm25 = _build_bm25(chunks)
     return len(chunks)
+
+
+def _build_bm25(chunks: list[Document]) -> BM25Retriever:
+    """Build a BM25 keyword retriever over the same chunks that live in the
+    FAISS index. BM25Retriever accepts an optional tokenizer; the default
+    whitespace tokenizer works fine for Hebrew because Hebrew words are
+    space-separated. k is set high because it's cheap and we merge with
+    vector results via EnsembleRetriever."""
+    retriever = BM25Retriever.from_documents(chunks)
+    retriever.k = 10
+    return retriever
 
 
 # ── Markdown-aware chunking ──────────────────────────────────────────────────
@@ -273,14 +310,33 @@ async def _translate_to_hebrew(question: str) -> str:
         return question
 
 
-def _retrieve(vs: FAISS, query: str, k: int = 6, fetch_k: int = 20) -> list[Document]:
-    """MMR retrieval — balances relevance and diversity so the LLM sees
-    multiple distinct regulations rather than near-duplicate passages."""
-    retriever = vs.as_retriever(
+def _retrieve(vs: FAISS, query: str, k: int = 8, fetch_k: int = 24) -> list[Document]:
+    """Hybrid retrieval: BM25 (exact keyword match) + FAISS/MMR (semantic).
+
+    BM25 is critical for Hebrew legal text because the corpus uses very
+    specific vocabulary (e.g. "תיבה" for junction box, "מבדד" for
+    insulator). Vector similarity alone often misses these when the user
+    phrases the question with a different synonym.
+
+    We combine the two with LangChain's ``EnsembleRetriever`` at 50/50
+    weights (Reciprocal Rank Fusion under the hood).
+    """
+    vector_retriever = vs.as_retriever(
         search_type="mmr",
         search_kwargs={"k": k, "fetch_k": fetch_k, "lambda_mult": 0.5},
     )
-    return retriever.invoke(query)
+
+    if _bm25 is None:
+        return vector_retriever.invoke(query)
+
+    # Tune BM25's own k for this query so both retrievers contribute a
+    # similar-sized candidate pool before fusion.
+    _bm25.k = k
+    ensemble = EnsembleRetriever(
+        retrievers=[_bm25, vector_retriever],
+        weights=[0.5, 0.5],
+    )
+    return ensemble.invoke(query)
 
 
 def _dedupe(docs: list[Document]) -> list[Document]:
@@ -381,12 +437,12 @@ async def ask(question: str, session_messages: list[dict] | None = None) -> dict
         }
 
     lang = _detect_language(question)
-    docs = _retrieve(vs, question, k=6, fetch_k=20)
+    docs = _retrieve(vs, question, k=8, fetch_k=24)
 
     if lang == "en":
         hebrew_query = await _translate_to_hebrew(question)
         if hebrew_query and hebrew_query.strip() and hebrew_query != question:
-            docs = _dedupe(docs + _retrieve(vs, hebrew_query, k=4, fetch_k=16))
+            docs = _dedupe(docs + _retrieve(vs, hebrew_query, k=6, fetch_k=20))
 
     context = _format_context(docs)
 
