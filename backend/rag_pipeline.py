@@ -84,7 +84,10 @@ ANSWER STRUCTURE for complex questions:
 def get_embeddings() -> OpenAIEmbeddings:
     global _embeddings
     if _embeddings is None:
-        _embeddings = OpenAIEmbeddings(model=EMBEDDING_MODEL)
+        _embeddings = OpenAIEmbeddings(
+            model=EMBEDDING_MODEL,
+            chunk_size=100,
+        )
     return _embeddings
 
 
