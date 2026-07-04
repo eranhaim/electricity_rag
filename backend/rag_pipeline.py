@@ -2,22 +2,27 @@
 RAG pipeline for Hebrew Israeli electricity law.
 
 Design notes:
-  * The vector store is built from raw Documents produced by
-    ``file_processor.load_file_documents`` — Hebrew is preserved as-is.
-  * Chunking: RecursiveCharacterTextSplitter, chunk_size=800, overlap=150.
-    Dense Hebrew legal text benefits from smaller, more focused chunks so a
-    single regulation lands inside one or two chunks (previous 1500/300 was
-    diluting relevance).
+  * Files are converted to Markdown by ``file_processor`` (MarkItDown) which
+    preserves the original Hebrew content plus structural cues: headings,
+    tables, lists.
+  * Chunking is two-stage:
+      1. ``MarkdownHeaderTextSplitter`` splits by Markdown header hierarchy
+         (# / ## / ###). Each resulting chunk carries the header path as
+         metadata (e.g. {"h1": "פרק ב", "h2": "התקנת מוליכים",
+         "h3": "תקנה 17"}). This lets the LLM cite the actual regulation
+         name/number instead of guessing a page.
+      2. ``RecursiveCharacterTextSplitter`` further splits any header
+         section that is still too large for a single retrieval unit.
+    This is markdown-aware chunking, which massively improves recall on
+    structured legal text vs. blind character splitting.
   * Retrieval: MMR (Maximal Marginal Relevance) to fetch diverse chunks and
     avoid returning six near-duplicates of the same paragraph.
   * Cross-lingual retrieval: when the question is in English, we ALSO run
     retrieval with a Hebrew translation of the question, because the corpus
-    is Hebrew. Results are merged and deduplicated. This gives better recall
-    without requiring a full agent loop.
+    is Hebrew. Results are merged and deduplicated.
   * Answer generation: LCEL-style flow (retrieve -> format context ->
-    prompt -> LLM). The system prompt enforces language matching, markdown
-    formatting, and citation of regulation numbers + page numbers from
-    document metadata.
+    prompt -> LLM). The system prompt enforces language matching, Markdown
+    formatting, and citation of regulation numbers taken from chunk headers.
 """
 
 from __future__ import annotations
@@ -27,7 +32,10 @@ import shutil
 from pathlib import Path
 
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.text_splitter import (
+    MarkdownHeaderTextSplitter,
+    RecursiveCharacterTextSplitter,
+)
 from langchain_community.vectorstores import FAISS
 from langchain.schema import AIMessage, Document, HumanMessage, SystemMessage
 
@@ -57,9 +65,9 @@ LANGUAGE RULE (HIGHEST PRIORITY — MUST FOLLOW):
 
 ACCURACY & CITATION RULES:
 - Use ONLY information explicitly present in the provided context. If the answer is not in the context, say so clearly ("המידע לא נמצא במאגר הידע" / "This information is not in the knowledge base"). NEVER invent regulation numbers, values, or facts.
-- ALWAYS cite the specific regulation, section, article, or clause number when it appears in the context (e.g., "לפי תקנה 17", "according to regulation 17").
-- ALWAYS cite the page number of the source document when relevant, in the format "(עמ' N)" for Hebrew or "(p. N)" for English. Take page numbers from the [page: N] markers in the context.
-- If a fact spans multiple regulations or pages, cite each one.
+- ALWAYS cite the specific regulation / section / clause when it appears in the context (e.g., "לפי תקנה 17", "according to regulation 17").
+- Take citations from the [section:] header path shown at the top of each chunk in the context, and from the source filename shown in [source:].
+- If a fact spans multiple regulations, cite each one.
 - Preserve exact numeric values, units, and thresholds from the source. Do not round or paraphrase numbers.
 
 FORMATTING RULES — ALWAYS use rich Markdown:
@@ -73,7 +81,7 @@ FORMATTING RULES — ALWAYS use rich Markdown:
 
 ANSWER STRUCTURE for complex questions:
 1. Short direct answer / summary (2-3 lines).
-2. Detailed explanation with citations to regulation numbers and page numbers.
+2. Detailed explanation with citations to regulation numbers / sections.
 3. Table or list of specific values/requirements when applicable.
 4. Notes, exceptions, or related regulations.
 """
@@ -144,13 +152,7 @@ def rebuild_vectorstore() -> int:
             stale.unlink(missing_ok=True)
         return 0
 
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=CHUNK_SIZE,
-        chunk_overlap=CHUNK_OVERLAP,
-        separators=["\n\n", "\n", ". ", "。", " ", ""],
-        length_function=len,
-    )
-    chunks = splitter.split_documents(documents)
+    chunks = _split_markdown_documents(documents)
 
     for i, c in enumerate(chunks):
         c.metadata["chunk_id"] = i
@@ -162,6 +164,76 @@ def rebuild_vectorstore() -> int:
     _vectorstore = FAISS.from_documents(chunks, get_embeddings())
     _vectorstore.save_local(str(VECTORSTORE_DIR))
     return len(chunks)
+
+
+# ── Markdown-aware chunking ──────────────────────────────────────────────────
+
+# Header hierarchy we care about. Matches MarkItDown output which uses
+# ATX headings (# ## ###). Values become metadata keys on each chunk.
+_HEADER_LEVELS = [
+    ("#", "h1"),
+    ("##", "h2"),
+    ("###", "h3"),
+    ("####", "h4"),
+]
+
+
+def _split_markdown_documents(documents: list[Document]) -> list[Document]:
+    """Two-stage split:
+        1. Split by Markdown headers → each chunk carries its header path as
+           metadata (h1/h2/h3/h4), giving the LLM a real "section" to cite.
+        2. Any header section that is still larger than ``CHUNK_SIZE`` is
+           further split by ``RecursiveCharacterTextSplitter`` while keeping
+           the parent header metadata intact.
+    Documents that contain no Markdown headers fall through to plain
+    character splitting.
+    """
+    header_splitter = MarkdownHeaderTextSplitter(
+        headers_to_split_on=_HEADER_LEVELS,
+        strip_headers=False,
+    )
+    char_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=CHUNK_SIZE,
+        chunk_overlap=CHUNK_OVERLAP,
+        separators=["\n\n", "\n", ". ", "。", " ", ""],
+        length_function=len,
+    )
+
+    all_chunks: list[Document] = []
+    for doc in documents:
+        source = doc.metadata.get("source", "unknown")
+
+        header_chunks = header_splitter.split_text(doc.page_content)
+
+        if not header_chunks:
+            for c in char_splitter.split_documents([doc]):
+                c.metadata["source"] = source
+                c.metadata["section"] = ""
+                all_chunks.append(c)
+            continue
+
+        for hc in header_chunks:
+            section_parts = [
+                hc.metadata[k] for k in ("h1", "h2", "h3", "h4") if hc.metadata.get(k)
+            ]
+            section = " > ".join(section_parts)
+
+            base_meta = {"source": source, "section": section, **hc.metadata}
+
+            if len(hc.page_content) <= CHUNK_SIZE:
+                all_chunks.append(
+                    Document(page_content=hc.page_content, metadata=base_meta)
+                )
+                continue
+
+            sub_docs = char_splitter.split_documents(
+                [Document(page_content=hc.page_content, metadata=base_meta)]
+            )
+            for sd in sub_docs:
+                sd.metadata.update(base_meta)
+                all_chunks.append(sd)
+
+    return all_chunks
 
 
 # ── Retrieval helpers ────────────────────────────────────────────────────────
@@ -208,14 +280,14 @@ def _retrieve(vs: FAISS, query: str, k: int = 6, fetch_k: int = 20) -> list[Docu
 
 
 def _dedupe(docs: list[Document]) -> list[Document]:
-    """Deduplicate by (source, page, first 80 chars) to merge results from
-    multiple retrieval passes without losing distinct chunks."""
+    """Deduplicate by (source, section, first 80 chars) so multiple retrieval
+    passes don't return the same chunk twice."""
     seen: set[tuple] = set()
     unique: list[Document] = []
     for d in docs:
         key = (
             d.metadata.get("source", ""),
-            d.metadata.get("page", d.metadata.get("chunk_id", "")),
+            d.metadata.get("section", ""),
             (d.page_content or "")[:80],
         )
         if key in seen:
@@ -228,12 +300,20 @@ def _dedupe(docs: list[Document]) -> list[Document]:
 # ── Prompt construction ──────────────────────────────────────────────────────
 
 def _format_context(docs: list[Document]) -> str:
-    """Format retrieved chunks into a numbered, cite-friendly context block."""
+    """Format retrieved chunks into a numbered, cite-friendly context block.
+
+    Each chunk header exposes:
+      - source: original filename (so the LLM can cite it)
+      - section: the Markdown header path (e.g. "פרק ב > תקנה 17") when
+        available — this is what enables regulation-number citations.
+    """
     lines: list[str] = []
     for i, d in enumerate(docs, start=1):
         src = d.metadata.get("source", "unknown")
-        page = d.metadata.get("page", d.metadata.get("sheet", "?"))
-        lines.append(f"[chunk {i} | source: {src} | page: {page}]\n{d.page_content}")
+        section = d.metadata.get("section") or "(no section)"
+        lines.append(
+            f"[chunk {i} | source: {src} | section: {section}]\n{d.page_content}"
+        )
     return "\n\n---\n\n".join(lines)
 
 
@@ -307,12 +387,12 @@ async def ask(question: str, session_messages: list[dict] | None = None) -> dict
     seen_pairs: set[tuple] = set()
     for d in docs:
         src = d.metadata.get("source", "unknown")
-        page = d.metadata.get("page")
-        key = (src, page)
+        section = d.metadata.get("section") or ""
+        key = (src, section)
         if key in seen_pairs:
             continue
         seen_pairs.add(key)
-        sources.append(f"{src} (p.{page})" if page is not None else src)
+        sources.append(f"{src} — {section}" if section else src)
 
     return {"answer": response.content, "sources": sources}
 
@@ -328,7 +408,7 @@ async def debug_retrieve(question: str, k: int = 8) -> list[dict]:
         {
             "score": float(score),
             "source": doc.metadata.get("source"),
-            "page": doc.metadata.get("page"),
+            "section": doc.metadata.get("section"),
             "snippet": (doc.page_content or "")[:400],
         }
         for doc, score in hits
