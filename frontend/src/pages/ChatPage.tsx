@@ -3,7 +3,7 @@ import { useNavigate } from "react-router-dom";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
-  MessageSquarePlus, Trash2, Send, Zap, Settings, Pencil, Check, X, Menu, ChevronLeft,
+  MessageSquarePlus, Trash2, Send, Zap, Settings, Pencil, Check, X, Menu, ChevronLeft, BookOpen,
 } from "lucide-react";
 import {
   fetchSessions, createSession, fetchSession, deleteSession,
@@ -18,6 +18,11 @@ export default function ChatPage() {
   const [sessions, setSessions] = useState<Session[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
+  // Sources are only returned by the /chat endpoint (not persisted per-message
+  // in the session store), so we keep them locally keyed by message index in
+  // the current view. Reset whenever we switch sessions.
+  const [messageSources, setMessageSources] = useState<Record<number, string[]>>({});
+  const [openSources, setOpenSources] = useState<Record<number, boolean>>({});
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -50,6 +55,8 @@ export default function ChatPage() {
     setActiveId(id);
     const s = await fetchSession(id);
     setMessages(s.messages || []);
+    setMessageSources({});
+    setOpenSources({});
   }
 
   async function handleDelete(id: string) {
@@ -87,7 +94,14 @@ export default function ChatPage() {
     try {
       const res = await sendMessage(sessionId, userMsg.content);
       const assistantMsg: Message = { role: "assistant", content: res.answer, timestamp: new Date().toISOString() };
-      setMessages((prev) => [...prev, assistantMsg]);
+      setMessages((prev) => {
+        const next = [...prev, assistantMsg];
+        // Store the sources against the (index of the assistant message we
+        // just appended). The user message is at length-1 before append; the
+        // assistant is at length after append. Use next.length-1.
+        setMessageSources((sp) => ({ ...sp, [next.length - 1]: res.sources || [] }));
+        return next;
+      });
 
       if (messages.length === 0) {
         const shortTitle = userMsg.content.slice(0, 50) + (userMsg.content.length > 50 ? "..." : "");
@@ -199,16 +213,42 @@ export default function ChatPage() {
             </div>
           ) : (
             <div className={styles.messages}>
-              {messages.map((m, i) => (
-                <div key={i} className={`${styles.messageRow} ${styles[m.role]}`}>
-                  <div className={styles.avatar}>
-                    {m.role === "user" ? "U" : <Zap size={16} />}
+              {messages.map((m, i) => {
+                const sources = messageSources[i];
+                const sourcesOpen = openSources[i];
+                return (
+                  <div key={i} className={`${styles.messageRow} ${styles[m.role]}`}>
+                    <div className={styles.avatar}>
+                      {m.role === "user" ? "U" : <Zap size={16} />}
+                    </div>
+                    <div className={styles.messageBubble}>
+                      <ReactMarkdown remarkPlugins={[remarkGfm]}>{m.content}</ReactMarkdown>
+                      {m.role === "assistant" && sources && sources.length > 0 && (
+                        <div className={styles.sourcesBlock}>
+                          <button
+                            className={styles.sourcesToggle}
+                            onClick={() =>
+                              setOpenSources((sp) => ({ ...sp, [i]: !sp[i] }))
+                            }
+                          >
+                            <BookOpen size={13} />
+                            <span>
+                              {t.sourcesLabel} ({sources.length})
+                            </span>
+                          </button>
+                          {sourcesOpen && (
+                            <ul className={styles.sourcesList}>
+                              {sources.map((s, si) => (
+                                <li key={si}>{s}</li>
+                              ))}
+                            </ul>
+                          )}
+                        </div>
+                      )}
+                    </div>
                   </div>
-                  <div className={styles.messageBubble}>
-                    <ReactMarkdown remarkPlugins={[remarkGfm]}>{m.content}</ReactMarkdown>
-                  </div>
-                </div>
-              ))}
+                );
+              })}
               {loading && (
                 <div className={`${styles.messageRow} ${styles.assistant}`}>
                   <div className={styles.avatar}><Zap size={16} /></div>

@@ -23,6 +23,31 @@ export interface UploadedFile {
   size: number;
 }
 
+export interface QALogChunk {
+  source: string | null;
+  section: string | null;
+  page: number | null;
+  chunk_id: number | null;
+  snippet: string;
+  full_length: number;
+}
+
+export interface QALogEntry {
+  ts: string;
+  session_id: string | null;
+  question: string;
+  answer: string;
+  refused: boolean;
+  sources_cited: string[];
+  retrieved_chunks: QALogChunk[];
+  extra?: {
+    lang?: string;
+    alt_queries?: string[];
+    hebrew_query?: string | null;
+    referenced_regs?: string[];
+  };
+}
+
 export async function fetchSessions(): Promise<Session[]> {
   const res = await fetch(`${API}/sessions`);
   return res.json();
@@ -97,8 +122,18 @@ export async function adminDeleteFile(password: string, filename: string): Promi
   });
 }
 
-export async function adminStatus(password: string): Promise<{ vectorstore_loaded: boolean; upload_count: number }> {
+export async function adminStatus(password: string): Promise<{ vectorstore_loaded: boolean; upload_count: number; qa_log_count?: number }> {
   const res = await fetch(`${API}/admin/status`, {
+    headers: { "x-admin-password": password },
+  });
+  return res.json();
+}
+
+export async function adminQaLog(
+  password: string,
+  limit: number = 50,
+): Promise<{ total: number; entries: QALogEntry[] }> {
+  const res = await fetch(`${API}/admin/qa_log?limit=${limit}`, {
     headers: { "x-admin-password": password },
   });
   return res.json();

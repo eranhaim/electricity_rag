@@ -14,8 +14,9 @@ export const translations = {
 
     // Chat input
     inputPlaceholder: "שאלו על חשמל...",
-    disclaimer: "התשובות מבוססות על מסמכי חשמל שהועלו. תמיד אמתו מידע קריטי.",
+    disclaimer: "מערכת זו היא כלי עזר לאיתור מידע בתקנות החשמל ואינה מחליפה שיקול דעת של מהנדס חשמל מוסמך.",
     errorMessage: "מצטער, משהו השתבש. נסו שוב.",
+    sourcesLabel: "מקורות",
 
     // Admin login
     adminAccess: "גישת מנהל",
@@ -42,6 +43,19 @@ export const translations = {
     uploadSuccess: (name: string, chunks: number) => `"${name}" עובד בהצלחה. ${chunks} חלקים אונדקסו.`,
     uploadFailed: "ההעלאה נכשלה",
 
+    // Q&A audit log
+    qaLogTitle: "יומן שאלות ותשובות",
+    qaLogDescription: "היסטוריית שאלות אחרונות, המקורות שנשלפו לכל שאלה והתשובה שנוצרה. השתמשו ביומן לסימון תשובות שגויות או לא מדויקות.",
+    qaLogCount: (n: number) => `${n} רשומות ביומן`,
+    qaLogEmpty: "עדיין אין רשומות ביומן.",
+    qaLogRefused: "לא נענתה",
+    qaLogRefreshed: "רענן",
+    qaLogQuestion: "שאלה",
+    qaLogAnswer: "תשובה",
+    qaLogChunks: "קטעים שנשלפו",
+    qaLogAltQueries: "שאילתות חלופיות",
+    qaLogReferencedRegs: "תקנות שאוזכרו",
+
     // Language toggle
     langToggle: "EN",
   },
@@ -55,8 +69,9 @@ export const translations = {
     emptyDescription: "Ask me anything about electricity, power systems, regulations, and more.",
 
     inputPlaceholder: "Ask about electricity...",
-    disclaimer: "Answers are based on uploaded electricity documents. Always verify critical information.",
+    disclaimer: "This system is an aid for finding information in Israeli electricity regulations and does not replace the judgement of a licensed electrical engineer.",
     errorMessage: "Sorry, something went wrong. Please try again.",
+    sourcesLabel: "Sources",
 
     adminAccess: "Admin Access",
     enterPassword: "Enter the admin password to manage documents.",

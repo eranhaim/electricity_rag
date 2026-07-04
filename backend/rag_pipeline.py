@@ -2,32 +2,39 @@
 RAG pipeline for Hebrew Israeli electricity law.
 
 Design notes:
-  * Files are converted to Markdown by ``file_processor`` (MarkItDown) which
-    preserves the original Hebrew content plus structural cues: headings,
-    tables, lists.
-  * Chunking is two-stage:
-      1. ``MarkdownHeaderTextSplitter`` splits by Markdown header hierarchy
-         (# / ## / ###). Each resulting chunk carries the header path as
-         metadata (e.g. {"h1": "פרק ב", "h2": "התקנת מוליכים",
-         "h3": "תקנה 17"}). This lets the LLM cite the actual regulation
-         name/number instead of guessing a page.
+  * Files → Markdown by ``file_processor`` (LLM-vision for PDFs, MarkItDown
+    for other formats), preserving Hebrew content + headings + tables.
+  * Chunking is markdown-aware:
+      0. Per-page split via ``<!-- page: N -->`` markers, so each chunk
+         carries a ``page`` metadata field for citation.
+      1. ``MarkdownHeaderTextSplitter`` splits by ``# / ## / ### / ####``.
+         Each chunk carries the header path as ``section`` metadata (e.g.
+         "פרק ב' > תקנה 17"), so the LLM can cite the actual regulation.
       2. ``RecursiveCharacterTextSplitter`` further splits any header
-         section that is still too large for a single retrieval unit.
-    This is markdown-aware chunking, which massively improves recall on
-    structured legal text vs. blind character splitting.
-  * Retrieval: MMR (Maximal Marginal Relevance) to fetch diverse chunks and
-    avoid returning six near-duplicates of the same paragraph.
-  * Cross-lingual retrieval: when the question is in English, we ALSO run
-    retrieval with a Hebrew translation of the question, because the corpus
-    is Hebrew. Results are merged and deduplicated.
-  * Answer generation: LCEL-style flow (retrieve -> format context ->
-    prompt -> LLM). The system prompt enforces language matching, Markdown
-    formatting, and citation of regulation numbers taken from chunk headers.
+         section that is still too large.
+  * Retrieval — several layers, applied in order:
+      a. **Query expansion**: an LLM produces 2-3 alternate Hebrew
+         phrasings of the user's question (synonyms, related terms). This
+         dramatically improves recall on Hebrew legal text where the same
+         concept has multiple names (e.g. "קופסה" vs "תיבה").
+      b. **Hybrid retrieval per query**: BM25 (keyword) + FAISS MMR
+         (semantic) fused via ``EnsembleRetriever`` (RRF).
+      c. **Regulation-reference chasing**: if any first-pass chunk mentions
+         "תקנה N" or "תקנה N(א)", we do a targeted BM25 lookup for that
+         specific regulation number to pull in its actual text.
+      d. **Cross-lingual**: English questions are additionally re-issued
+         in Hebrew for extra recall against the Hebrew corpus.
+  * Answering: LCEL-style. System prompt enforces language matching, rich
+    Markdown formatting, "פרשנות מקצועית" markers when combining regs, and
+    citation of regulation number + page from chunk metadata.
+  * Every Q&A pair is appended to an audit log (backend/qa_log.py) so the
+    professional reviewer can spot-check answers — a POC roadmap deliverable.
 """
 
 from __future__ import annotations
 
 import os
+import re
 import shutil
 from pathlib import Path
 
@@ -52,6 +59,7 @@ from backend.config import (
 )
 from backend.file_processor import load_file_documents_async
 from backend.pdf_llm_ocr import split_markdown_by_page_markers
+from backend.qa_log import log_qa
 
 os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
 
@@ -64,37 +72,68 @@ _embeddings: OpenAIEmbeddings | None = None
 _chunks: list[Document] = []
 _bm25: BM25Retriever | None = None
 
-SYSTEM_PROMPT = """You are a senior expert assistant specializing in Israeli electricity regulations, standards, and electrical safety codes ("תקנות החשמל"). You answer questions based ONLY on the provided context documents from the knowledge base.
+SYSTEM_PROMPT = """You are a senior expert assistant for Israeli electricity regulations ("תקנות החשמל"), advising licensed electricians and electrical engineers. You answer questions using ONLY the provided context from the knowledge base.
 
-LANGUAGE RULE (HIGHEST PRIORITY — MUST FOLLOW):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+LANGUAGE (HIGHEST PRIORITY — NEVER BREAK)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 - Detect the language of the user's CURRENT question.
-- If the question is in Hebrew → your ENTIRE answer MUST be in Hebrew.
-- If the question is in English → your ENTIRE answer MUST be in English (translate content from Hebrew context into English).
-- NEVER mix languages in a single answer.
+- Hebrew question → entire answer in Hebrew.
+- English question → entire answer in English (translate context as needed).
+- NEVER mix languages in one answer.
 
-ACCURACY & CITATION RULES:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ACCURACY, GROUNDING, AND CITATIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 - Use ONLY information explicitly present in the provided context. NEVER invent regulation numbers, values, or facts.
-- Read the ENTIRE context carefully before concluding "not found". The context may be fragmented (e.g. RTL Hebrew PDF extraction can produce jumbled word order); if any chunk contains information that plausibly answers the question, USE IT and cite that chunk. Do not require an exact keyword match.
-- ONLY refuse ("המידע לא נמצא במאגר הידע" / "This information is not in the knowledge base") when the context truly contains no relevant material. When you refuse, briefly say which related topics DID appear in the context so the user can rephrase.
-- ALWAYS cite the specific regulation / section / clause when it appears in the context (e.g., "לפי תקנה 17", "according to regulation 17"). Regulation numbers usually appear at the start of a paragraph in the Hebrew text.
-- Take citations from any [section:] header shown at the top of the chunk, and from the source filename shown in [source:] plus the [page:] number when present.
-- If a fact spans multiple regulations, cite each one.
-- Preserve exact numeric values, units, and thresholds from the source. Do not round or paraphrase numbers.
+- Be thorough: read the ENTIRE context before concluding "not found". Hebrew PDFs sometimes have jumbled word order or OCR noise; if the meaning is clearly present in any chunk, USE IT.
+- Prefer specific facts (numbers, thresholds, regulation numbers) from the context over general summaries.
+- ALWAYS cite the specific regulation and, when available, the page number. Format:
+  * Hebrew: "לפי תקנה 17 (עמ' 33)" or "כאמור בתקנה 49(ג)"
+  * English: "under regulation 17 (p. 33)" or "per regulation 49(c)"
+- Take citations from the ``[section: ...]`` header path or the leading "### תקנה N." line inside the chunk, and from the ``[page: N]`` marker.
+- If information spans multiple regulations, cite each one.
+- Preserve EXACT numeric values, units, and thresholds. Never round, convert, or paraphrase numbers.
 
-FORMATTING RULES — ALWAYS use rich Markdown:
-- Use **bold** for key terms, regulation names, and threshold values.
-- Use bullet or numbered lists for multiple items, steps, or requirements.
-- Use ## and ### headers to organize longer answers into scannable sections.
-- When presenting comparative data, distances, measurements, intervals, thresholds, resistances, currents, or any structured data — ALWAYS present it as a Markdown table with clear column headers.
-- Use > blockquotes for direct quotations from regulations.
-- If the user asks for a table, you MUST answer with a table.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+DIRECT LAW vs PROFESSIONAL INTERPRETATION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Distinguish clearly between what the law directly says and what you're inferring:
+- **📖 מהחוק ישירות / Direct from the law**: quote or paraphrase from a single explicit regulation. Prefer > blockquotes for verbatim text.
+- **🧠 פרשנות מקצועית / Professional interpretation**: when you combine multiple regulations, apply them to a specific scenario, or explain implications. Prefix with a small header: `**🧠 פרשנות מקצועית:**` (Hebrew) or `**🧠 Professional interpretation:**` (English).
+- Never blur the two.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+WHEN INFORMATION IS PARTIAL OR MISSING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+- If the context has PARTIAL info (some but not all aspects of the question): answer the parts that ARE covered with citations, then explicitly state what wasn't covered ("היבטים נוספים כמו X לא מופיעים במאגר").
+- If the context has NO relevant info at all: reply "המידע לא נמצא במאגר הידע" (Hebrew) or "This information is not in the knowledge base" (English), then list the related topics that DID appear so the user can rephrase.
+- Do not refuse if any chunk plausibly answers the question.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FORMATTING — always use rich Markdown
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+- **Bold** for key terms, regulation names, and threshold values.
+- Bullet / numbered lists for multiple items, steps, requirements.
+- ## and ### headers to organize longer answers.
+- Markdown tables for any comparative or tabular data (distances, cross-sections, currents, intervals, resistances, thresholds).
+- > blockquotes for verbatim regulation text.
 - Keep answers thorough but scannable — avoid long unbroken paragraphs.
 
-ANSWER STRUCTURE for complex questions:
-1. Short direct answer / summary (2-3 lines).
-2. Detailed explanation with citations to regulation numbers / sections.
-3. Table or list of specific values/requirements when applicable.
-4. Notes, exceptions, or related regulations.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STANDARD ANSWER STRUCTURE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+For non-trivial questions, structure the answer as:
+1. **תשובה קצרה / Short answer** — 2-3 lines with the direct requirement + main citation.
+2. **פירוט / Detail** — the relevant regulation text, with tables or bullets.
+3. **חריגים / הערות / Exceptions & notes** — related regs, exceptions, edge cases.
+4. **פרשנות מקצועית** — if you combined multiple regs, label the inference here.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SAFETY DISCLAIMER (always end with this line, in the same language as the answer)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Hebrew: "_מערכת זו היא כלי עזר ואינה מחליפה שיקול דעת של מהנדס חשמל מוסמך._"
+English: "_This system is an aid and does not replace the judgement of a licensed electrical engineer._"
 """
 
 
@@ -332,6 +371,90 @@ async def _translate_to_hebrew(question: str) -> str:
         return question
 
 
+async def _expand_query(question: str, lang: str) -> list[str]:
+    """Ask the LLM for 2-3 alternate phrasings of the question using
+    domain-specific synonyms. Returns the alternate queries (without the
+    original — the caller merges that in). Best-effort.
+
+    For Hebrew legal text this is a big deal because the same object has
+    many names (קופסה / תיבה / קופסת חיבור / קופסת הסתעפות for junction box).
+    Vector similarity partly bridges this, BM25 does not, so alt phrasings
+    let both retrievers hit the right chunks.
+    """
+    try:
+        prompt_lang = "Hebrew" if lang == "he" else "English"
+        system = (
+            "You are a query rewriter for a retrieval system over Israeli "
+            "electricity regulations (חוק החשמל).\n"
+            f"Given the user's question in {prompt_lang}, output 2 to 3 "
+            f"alternate short {prompt_lang} phrasings that use different but "
+            "equivalent electrical/legal terminology (synonyms, hyponyms, "
+            "regulation-style vocabulary). Focus on nouns and technical terms.\n"
+            "Rules:\n"
+            "- Output ONE alternate query per line. No numbering, no quotes, "
+            "no commentary.\n"
+            "- Keep each alt query short (≤ 12 words).\n"
+            "- Never invent regulation numbers.\n"
+            "- If the question is in Hebrew, output alt queries in Hebrew. "
+            "If in English, output in English."
+        )
+        llm = ChatOpenAI(model=LLM_MODEL, temperature=0.2)
+        resp = await llm.ainvoke([
+            SystemMessage(content=system),
+            HumanMessage(content=question),
+        ])
+        raw = (resp.content or "").strip()
+        alts: list[str] = []
+        for line in raw.splitlines():
+            line = line.strip("- •\t ").strip()
+            if not line or line == question:
+                continue
+            alts.append(line)
+        return alts[:3]
+    except Exception:  # noqa: BLE001
+        return []
+
+
+# Matches Hebrew regulation references like "תקנה 17", "תקנה 99(א)",
+# "תקנה 7(ג)(2)". Group 1 = the raw number+clause suffix.
+_REG_REF_RE = re.compile(r"תקנה\s+(\d+(?:\([א-ת0-9]+\))*)")
+
+
+def _extract_reg_references(docs: list[Document], max_refs: int = 5) -> list[str]:
+    """Scan retrieved chunks for regulation references ('תקנה N', 'תקנה N(א)')
+    and return the top-N most-frequent ones. Used to trigger a targeted BM25
+    lookup that pulls in the actual text of referenced regulations.
+    """
+    if not docs:
+        return []
+
+    counts: dict[str, int] = {}
+    for d in docs:
+        for m in _REG_REF_RE.finditer(d.page_content or ""):
+            key = m.group(1)
+            counts[key] = counts.get(key, 0) + 1
+    ranked = sorted(counts.items(), key=lambda kv: kv[1], reverse=True)
+    return [key for key, _ in ranked[:max_refs]]
+
+
+def _bm25_regulation_lookup(reg_ids: list[str], k_per_ref: int = 2) -> list[Document]:
+    """For each referenced regulation id (e.g. "17" or "7(ג)"), pull the top
+    BM25 hits whose text or section explicitly names that regulation. This
+    fetches the actual regulation text when other chunks only reference it.
+    """
+    if not reg_ids or _bm25 is None:
+        return []
+    _bm25.k = k_per_ref
+    results: list[Document] = []
+    for reg_id in reg_ids:
+        query = f"תקנה {reg_id}"
+        try:
+            results.extend(_bm25.invoke(query))
+        except Exception:  # noqa: BLE001
+            continue
+    return results
+
+
 def _retrieve(vs: FAISS, query: str, k: int = 8, fetch_k: int = 24) -> list[Document]:
     """Hybrid retrieval: BM25 (exact keyword match) + FAISS/MMR (semantic).
 
@@ -441,56 +564,125 @@ def _build_messages(
 
 # ── Public API ───────────────────────────────────────────────────────────────
 
-async def ask(question: str, session_messages: list[dict] | None = None) -> dict:
+async def ask(
+    question: str,
+    session_messages: list[dict] | None = None,
+    session_id: str | None = None,
+) -> dict:
     """Answer a question grounded in the vector store.
 
+    Multi-stage retrieval:
+      1. Original query → hybrid retrieval (BM25 + FAISS MMR)
+      2. LLM query expansion → 2-3 alt Hebrew/English phrasings → same
+         hybrid retrieval per alt query
+      3. Cross-lingual: if question is English, also retrieve on a Hebrew
+         translation
+      4. Regulation-reference chasing: if first-pass hits mention "תקנה N",
+         BM25-fetch the actual text of those regulations
+
+    All retrieved chunks are deduplicated and passed to the LLM.
+
     Returns ``{"answer": str, "sources": list[str]}`` — the same shape the
-    frontend already consumes.
+    frontend consumes.
     """
     vs = get_vectorstore()
     if vs is None:
-        return {
-            "answer": (
-                "מאגר הידע עדיין לא נטען. יש לפנות למנהל המערכת להעלאת "
-                "מסמכים.\n\nNo knowledge base loaded. Please ask an admin to "
-                "upload documents first."
-            ),
-            "sources": [],
-        }
+        answer = (
+            "מאגר הידע עדיין לא נטען. יש לפנות למנהל המערכת להעלאת מסמכים."
+            "\n\nNo knowledge base loaded. Please ask an admin to upload "
+            "documents first."
+        )
+        return {"answer": answer, "sources": []}
 
     lang = _detect_language(question)
-    docs = _retrieve(vs, question, k=8, fetch_k=24)
 
+    # --- Stage 1: primary hybrid retrieval on the original query ---
+    all_docs: list[Document] = _retrieve(vs, question, k=8, fetch_k=24)
+
+    # --- Stage 2: query expansion (LLM-generated alt phrasings) ---
+    alt_queries = await _expand_query(question, lang)
+    for alt in alt_queries:
+        all_docs.extend(_retrieve(vs, alt, k=5, fetch_k=16))
+
+    # --- Stage 3: cross-lingual boost for English questions ---
+    hebrew_query: str | None = None
     if lang == "en":
         hebrew_query = await _translate_to_hebrew(question)
         if hebrew_query and hebrew_query.strip() and hebrew_query != question:
-            docs = _dedupe(docs + _retrieve(vs, hebrew_query, k=6, fetch_k=20))
+            all_docs.extend(_retrieve(vs, hebrew_query, k=6, fetch_k=20))
+
+    docs = _dedupe(all_docs)
+
+    # --- Stage 4: regulation-reference chasing ---
+    referenced = _extract_reg_references(docs, max_refs=5)
+    if referenced:
+        chased = _bm25_regulation_lookup(referenced, k_per_ref=2)
+        if chased:
+            docs = _dedupe(docs + chased)
+
+    # Cap total context to a reasonable size (best hits first, deduped).
+    docs = docs[:20]
 
     context = _format_context(docs)
 
     llm = ChatOpenAI(model=LLM_MODEL, temperature=0.1)
     messages = _build_messages(question, context, session_messages)
     response = await llm.ainvoke(messages)
+    answer = response.content or ""
 
+    sources = _build_source_list(docs)
+    refused = _detect_refusal(answer)
+
+    log_qa(
+        session_id=session_id,
+        question=question,
+        answer=answer,
+        retrieved=docs,
+        sources=sources,
+        refused=refused,
+        extra={
+            "lang": lang,
+            "alt_queries": alt_queries,
+            "hebrew_query": hebrew_query,
+            "referenced_regs": referenced,
+        },
+    )
+
+    return {"answer": answer, "sources": sources}
+
+
+def _build_source_list(docs: list[Document]) -> list[str]:
+    """Produce a compact, unique source list for the frontend footer."""
     sources: list[str] = []
-    seen_pairs: set[tuple] = set()
+    seen: set[tuple] = set()
     for d in docs:
         src = d.metadata.get("source", "unknown")
         section = d.metadata.get("section") or ""
         page = d.metadata.get("page")
         key = (src, section, page)
-        if key in seen_pairs:
+        if key in seen:
             continue
-        seen_pairs.add(key)
+        seen.add(key)
 
         label = src
         if section:
             label += f" — {section}"
-        elif page is not None:
+        if page is not None:
             label += f" (p.{page})"
         sources.append(label)
+    return sources
 
-    return {"answer": response.content, "sources": sources}
+
+def _detect_refusal(answer: str) -> bool:
+    """Return True if the answer contains the "not in knowledge base" refusal
+    phrase (used for the Q&A audit log)."""
+    if not answer:
+        return False
+    lowered = answer.lower()
+    return (
+        "המידע לא נמצא במאגר הידע" in answer
+        or "not in the knowledge base" in lowered
+    )
 
 
 async def debug_retrieve(question: str, k: int = 8) -> list[dict]:

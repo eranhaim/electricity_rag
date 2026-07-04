@@ -13,6 +13,7 @@ from backend.sessions import (
 )
 from backend.rag_pipeline import ask, rebuild_vectorstore, get_vectorstore
 from backend.file_processor import process_file
+from backend.qa_log import read_recent as read_qa_log, count_entries as count_qa_log
 
 app = FastAPI(title="Electricity RAG Agent")
 
@@ -83,7 +84,11 @@ async def api_chat(session_id: str, body: ChatRequest):
 
     add_message(session_id, "user", body.message)
 
-    result = await ask(body.message, session.get("messages"))
+    result = await ask(
+        body.message,
+        session.get("messages"),
+        session_id=session_id,
+    )
     add_message(session_id, "assistant", result["answer"])
 
     if len(session["messages"]) == 0:
@@ -186,6 +191,18 @@ def api_admin_status():
     return {
         "vectorstore_loaded": vs is not None,
         "upload_count": len([f for f in UPLOADS_DIR.iterdir() if f.is_file() and f.name != ".gitkeep"]),
+        "qa_log_count": count_qa_log(),
+    }
+
+
+@app.get("/api/admin/qa_log", dependencies=[Depends(verify_admin)])
+def api_qa_log(limit: int = 50):
+    """Return the most recent Q&A audit entries so a reviewer (Ori) can
+    spot-check answer quality. Newest first."""
+    limit = max(1, min(limit, 500))
+    return {
+        "total": count_qa_log(),
+        "entries": read_qa_log(limit=limit),
     }
 
 
