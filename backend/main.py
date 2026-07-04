@@ -127,7 +127,7 @@ async def api_upload_file(file: UploadFile = File(...)):
         dest.unlink(missing_ok=True)
         raise HTTPException(500, f"Processing failed: {e}")
 
-    chunk_count = rebuild_vectorstore()
+    chunk_count = await rebuild_vectorstore()
     return {
         "ok": True,
         "filename": file.filename,
@@ -136,7 +136,7 @@ async def api_upload_file(file: UploadFile = File(...)):
 
 
 @app.delete("/api/admin/files/{filename}", dependencies=[Depends(verify_admin)])
-def api_delete_file(filename: str):
+async def api_delete_file(filename: str):
     upload_path = UPLOADS_DIR / filename
     if not upload_path.exists():
         raise HTTPException(404, "File not found")
@@ -145,12 +145,13 @@ def api_delete_file(filename: str):
     processed_dir = UPLOADS_DIR.parent / "processed"
     stem = Path(filename).stem
     for candidate in [
+        processed_dir / f"{stem}.md",
         processed_dir / f"{stem}.txt",
         processed_dir / f"{stem}_optimized.txt",
     ]:
         candidate.unlink(missing_ok=True)
 
-    chunk_count = rebuild_vectorstore()
+    chunk_count = await rebuild_vectorstore()
     return {"ok": True, "chunks_indexed": chunk_count}
 
 
@@ -170,7 +171,7 @@ async def api_reindex():
         except Exception as e:  # noqa: BLE001
             errors.append(f"{f.name}: {e}")
 
-    chunk_count = rebuild_vectorstore()
+    chunk_count = await rebuild_vectorstore()
     return {
         "ok": True,
         "files_processed": len(upload_files) - len(errors),

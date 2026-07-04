@@ -50,7 +50,7 @@ from backend.config import (
     CHUNK_SIZE,
     CHUNK_OVERLAP,
 )
-from backend.file_processor import load_file_documents
+from backend.file_processor import load_file_documents_async
 from backend.pdf_llm_ocr import split_markdown_by_page_markers
 
 os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
@@ -136,13 +136,12 @@ def get_vectorstore(force_reload: bool = False) -> FAISS | None:
     return _vectorstore
 
 
-def rebuild_vectorstore() -> int:
+async def rebuild_vectorstore() -> int:
     """Rebuild the FAISS index (and in-memory BM25 corpus) from every file
     currently in ``data/uploads``.
 
-    Loads raw Documents (with source + page metadata) directly via
-    ``load_file_documents`` — the ``data/processed/*.md``/``.txt`` artifacts
-    are only for human debugging and are NOT used for retrieval.
+    Uses the async loader because PDFs go through LLM-vision extraction.
+    All page-level extraction is cached to disk, so re-runs are cheap.
 
     Returns the number of chunks indexed.
     """
@@ -164,7 +163,7 @@ def rebuild_vectorstore() -> int:
     documents: list[Document] = []
     for f in upload_files:
         try:
-            documents.extend(load_file_documents(f))
+            documents.extend(await load_file_documents_async(f))
         except Exception as e:  # noqa: BLE001
             print(f"[rag_pipeline] failed to load {f.name}: {e}")
 

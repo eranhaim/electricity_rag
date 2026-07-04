@@ -131,20 +131,17 @@ async def load_file_documents_async(file_path: Path) -> list[Document]:
 
 
 def load_file_documents(file_path: Path) -> list[Document]:
-    """Sync wrapper that dispatches to the right loader and runs the async
-    PDF path via ``asyncio.run``. Kept for compatibility with existing sync
-    callers like ``rag_pipeline.rebuild_vectorstore``.
+    """Sync loader (non-PDF only).
+
+    PDFs require the async vision path — call ``load_file_documents_async``
+    from an async context instead. Using this sync function for a PDF raises
+    a clear error rather than deadlocking on nested event loops.
     """
     if file_path.suffix.lower() == ".pdf":
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            loop = None
-        if loop is not None and loop.is_running():
-            # Called from an already-running loop (e.g. FastAPI handler).
-            future = asyncio.run_coroutine_threadsafe(_load_pdf(file_path), loop)
-            return future.result()
-        return asyncio.run(_load_pdf(file_path))
+        raise RuntimeError(
+            "PDFs must be loaded via load_file_documents_async (async vision "
+            "extraction); calling the sync path would deadlock."
+        )
     return _load_via_markitdown(file_path)
 
 

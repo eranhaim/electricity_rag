@@ -32,7 +32,7 @@ async def main() -> int:
         except Exception as e:  # noqa: BLE001
             print(f"      !! failed: {e}")
 
-    chunks = rebuild_vectorstore()
+    chunks = await rebuild_vectorstore()
     print(f"\nRebuilt vector store: {chunks} chunks indexed.")
     return 0
 
