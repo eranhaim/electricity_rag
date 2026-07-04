@@ -1,37 +1,44 @@
 """
 File processor for the Electricity RAG.
 
-Hybrid strategy:
-  * PDFs → PyPDFLoader (per-page). PyPDFLoader (via pypdf) handles Hebrew
-    text correctly. MarkItDown/pdfminer returns garbled CID codes for many
-    Hebrew PDFs with embedded fonts, so it's NOT used here.
+Strategy per format:
+  * PDFs → LLM-vision (gpt-4o) via ``pdf_llm_ocr``. Each page image goes
+    through a strict Hebrew-preserving prompt that emits structured Markdown
+    (# פרק, ### תקנה N., tables, lists) with page markers. This dramatically
+    outperforms text-only PDF extraction on Hebrew legal documents. Falls
+    back to PyPDFLoader if vision fails (network/API errors).
   * Everything else (DOCX, PPTX, XLSX, HTML, CSV, JSON, XML, EPub, images,
-    audio, ...) → MarkItDown. Markdown preserves headings, tables, and
-    lists — the structural cues that ``MarkdownHeaderTextSplitter`` uses
-    downstream for regulation-level chunking.
+    audio, ...) → Microsoft MarkItDown, which produces clean Markdown.
 
-No LLM is applied to the extracted text — preserving the original Hebrew
-content is essential (the earlier "LLM optimization" step corrupted values).
+The extraction NEVER translates, summarizes, or paraphrases source content.
+Preserving the original Hebrew and every numeric value is essential.
 
-A debug artifact (``.md`` for MarkItDown formats, ``.txt`` for PDFs) is written
-to ``data/processed/`` so a human can inspect exactly what the retriever
-sees. The vector store is (re)built from the returned Documents directly.
+Debug artifacts:
+    ``data/processed/<name>.md`` for MarkItDown and vision outputs
+    ``data/processed/pages/<name>/page_NNNN.md`` for per-page vision caches
+
+The vector store is (re)built from the returned Documents directly by
+``rag_pipeline.rebuild_vectorstore()``. This module returns one Document per
+uploaded file whose ``page_content`` is the full Markdown; header-aware
+chunking happens later.
 """
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 from langchain.schema import Document
 
 from backend.config import PROCESSED_DIR
+from backend.pdf_llm_ocr import convert_pdf_to_markdown
 
 
 _markitdown = None
 
 
 def _get_markitdown():
-    """Lazily construct a single MarkItDown instance (cheap but reusable)."""
+    """Lazily construct a single MarkItDown instance."""
     global _markitdown
     if _markitdown is None:
         from markitdown import MarkItDown
@@ -40,40 +47,57 @@ def _get_markitdown():
     return _markitdown
 
 
-def _load_pdf(file_path: Path) -> list[Document]:
-    """Load a PDF into one Document per page using PyPDFLoader.
-
-    Kept as its own path because MarkItDown/pdfminer returns garbage
-    ``(cid:NNN)`` codes for many Hebrew PDFs; pypdf's extraction preserves
-    the original Hebrew characters.
-    """
+def _pdf_fallback_pypdf(file_path: Path) -> str:
+    """Emergency fallback: PyPDFLoader per page → concatenated Markdown with
+    ``<!-- page: N -->`` markers so downstream chunking still gets page
+    metadata."""
     from langchain_community.document_loaders import PyPDFLoader
 
     loader = PyPDFLoader(str(file_path))
     raw_docs = loader.load()
 
-    docs: list[Document] = []
-    for i, d in enumerate(raw_docs):
-        text = (d.page_content or "").strip()
-        if not text:
-            continue
-        docs.append(
+    parts: list[str] = []
+    for i, d in enumerate(raw_docs, start=1):
+        parts.append(f"<!-- page: {i} -->")
+        parts.append((d.page_content or "").strip())
+    return "\n\n".join(parts) + "\n"
+
+
+async def _load_pdf_via_vision(file_path: Path) -> str:
+    """Primary PDF path: LLM-vision → structured Hebrew Markdown."""
+
+    def _progress(done: int, total: int, result) -> None:
+        marker = "cached" if result.from_cache else "processed"
+        print(f"[file_processor] {file_path.name}: {done}/{total} pages ({marker})")
+
+    return await convert_pdf_to_markdown(file_path, on_progress=_progress)
+
+
+async def _load_pdf(file_path: Path) -> list[Document]:
+    try:
+        markdown = await _load_pdf_via_vision(file_path)
+        if markdown.strip():
+            return [
+                Document(
+                    page_content=markdown,
+                    metadata={"source": file_path.name, "extractor": "gpt-4o-vision"},
+                )
+            ]
+        raise RuntimeError("vision returned empty markdown")
+    except Exception as e:  # noqa: BLE001
+        print(f"[file_processor] vision extraction failed for {file_path.name}: {e}")
+        markdown = _pdf_fallback_pypdf(file_path)
+        if not markdown.strip():
+            return []
+        return [
             Document(
-                page_content=text,
-                metadata={
-                    "source": file_path.name,
-                    "page": i + 1,
-                    "total_pages": len(raw_docs),
-                },
+                page_content=markdown,
+                metadata={"source": file_path.name, "extractor": "pypdf-fallback"},
             )
-        )
-    return docs
+        ]
 
 
 def _load_via_markitdown(file_path: Path) -> list[Document]:
-    """Convert a file to Markdown via MarkItDown, returned as a single
-    Document. Header-aware chunking (in ``rag_pipeline``) will split it into
-    section-tagged chunks."""
     md = _get_markitdown()
     text = ""
     try:
@@ -92,59 +116,59 @@ def _load_via_markitdown(file_path: Path) -> list[Document]:
         return []
 
     return [
-        Document(page_content=text, metadata={"source": file_path.name})
+        Document(
+            page_content=text,
+            metadata={"source": file_path.name, "extractor": "markitdown"},
+        )
     ]
 
 
+async def load_file_documents_async(file_path: Path) -> list[Document]:
+    """Async loader (needed for PDF vision path)."""
+    if file_path.suffix.lower() == ".pdf":
+        return await _load_pdf(file_path)
+    return _load_via_markitdown(file_path)
+
+
 def load_file_documents(file_path: Path) -> list[Document]:
-    """Dispatch to the right loader based on file extension.
-
-    Returns Documents with faithfully preserved content and ``source``
-    metadata (plus ``page`` for PDFs). NEVER translates or paraphrases.
+    """Sync wrapper that dispatches to the right loader and runs the async
+    PDF path via ``asyncio.run``. Kept for compatibility with existing sync
+    callers like ``rag_pipeline.rebuild_vectorstore``.
     """
-    suffix = file_path.suffix.lower()
-
-    if suffix == ".pdf":
-        return _load_pdf(file_path)
-
+    if file_path.suffix.lower() == ".pdf":
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        if loop is not None and loop.is_running():
+            # Called from an already-running loop (e.g. FastAPI handler).
+            future = asyncio.run_coroutine_threadsafe(_load_pdf(file_path), loop)
+            return future.result()
+        return asyncio.run(_load_pdf(file_path))
     return _load_via_markitdown(file_path)
 
 
 def _write_debug_artifact(file_path: Path, docs: list[Document]) -> Path:
-    """Write a human-readable artifact for transparency/debugging.
-
-    * ``.md`` for MarkItDown-processed files (Markdown output)
-    * ``.txt`` for PDFs, with per-page separators (plain text output)
-
-    This artifact is NOT used for retrieval — the vector store is built
-    from the Document objects directly.
+    """Write a human-readable ``.md`` artifact of the extraction, per file.
+    NOT used for retrieval — the vector store is built from ``docs`` directly.
     """
-    suffix = file_path.suffix.lower()
-    if suffix == ".pdf":
-        output_path = PROCESSED_DIR / (file_path.stem + ".txt")
-        parts: list[str] = []
-        for d in docs:
-            page = d.metadata.get("page", "?")
-            parts.append(f"--- {file_path.name} | page {page} ---\n{d.page_content}")
-        output_path.write_text("\n\n".join(parts), encoding="utf-8")
-    else:
-        output_path = PROCESSED_DIR / (file_path.stem + ".md")
-        output_path.write_text(
-            "\n\n---\n\n".join(d.page_content for d in docs),
-            encoding="utf-8",
-        )
+    output_path = PROCESSED_DIR / (file_path.stem + ".md")
+    output_path.write_text(
+        "\n\n---\n\n".join(d.page_content for d in docs),
+        encoding="utf-8",
+    )
     return output_path
 
 
 async def process_file(file_path: Path) -> Path:
-    """Extract text from a file into Documents (no LLM rewriting), write a
-    debug artifact, and return the artifact path.
+    """Extract text from a file into Documents (no LLM rewriting of content),
+    write a debug ``.md`` artifact, and return the artifact path.
 
     The retrieval index is (re)built from the raw Documents by
     ``rag_pipeline.rebuild_vectorstore()``, which the upload handler calls
     immediately after this function.
     """
-    docs = load_file_documents(file_path)
+    docs = await load_file_documents_async(file_path)
     if not docs:
         raise ValueError(f"No extractable text in {file_path.name}")
     return _write_debug_artifact(file_path, docs)

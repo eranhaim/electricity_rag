@@ -51,6 +51,7 @@ from backend.config import (
     CHUNK_OVERLAP,
 )
 from backend.file_processor import load_file_documents
+from backend.pdf_llm_ocr import split_markdown_by_page_markers
 
 os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
 
@@ -215,16 +216,31 @@ _HEADER_LEVELS = [
 ]
 
 
+def _pages_from_document(doc: Document) -> list[tuple[int | None, str]]:
+    """If the document's Markdown contains ``<!-- page: N -->`` markers,
+    split it into (page, markdown) pairs. Otherwise return a single
+    (None, whole_content) pair."""
+    content = doc.page_content or ""
+    if "<!-- page:" not in content:
+        return [(None, content)]
+    pairs = split_markdown_by_page_markers(content)
+    return [(p, md) for p, md in pairs if md.strip()]
+
+
 def _split_markdown_documents(documents: list[Document]) -> list[Document]:
-    """Two-stage split:
-        1. Split by Markdown headers → each chunk carries its header path as
-           metadata (h1/h2/h3/h4), giving the LLM a real "section" to cite.
-        2. Any header section that is still larger than ``CHUNK_SIZE`` is
-           further split by ``RecursiveCharacterTextSplitter`` while keeping
-           the parent header metadata intact.
-    Documents that contain no Markdown headers (e.g. PDF pages extracted by
-    PyPDFLoader) fall through to plain character splitting while preserving
-    the original metadata (including ``page`` for PDFs).
+    """Three-stage split for a Markdown corpus:
+        0. Peel off per-page sections using ``<!-- page: N -->`` markers so
+           every downstream chunk carries a ``page`` metadata field for
+           citation (PDF vision output uses these markers).
+        1. Split by Markdown headers (# / ## / ### / ####) → each chunk
+           carries its header path as ``section`` metadata (e.g.
+           "פרק ב' > תקנה 17. גובה התקנת תיבה"). This gives the LLM a real
+           regulation to cite instead of guessing.
+        2. Any header section still larger than ``CHUNK_SIZE`` is further
+           split by ``RecursiveCharacterTextSplitter`` while keeping parent
+           header + page metadata intact.
+    Documents without headers fall through to plain character splitting with
+    metadata preserved.
     """
     header_splitter = MarkdownHeaderTextSplitter(
         headers_to_split_on=_HEADER_LEVELS,
@@ -239,40 +255,47 @@ def _split_markdown_documents(documents: list[Document]) -> list[Document]:
 
     all_chunks: list[Document] = []
     for doc in documents:
-        source = doc.metadata.get("source", "unknown")
         parent_meta = dict(doc.metadata)
+        source = parent_meta.get("source", "unknown")
 
-        header_chunks = header_splitter.split_text(doc.page_content)
+        for page_num, page_md in _pages_from_document(doc):
+            page_meta = dict(parent_meta)
+            if page_num is not None:
+                page_meta["page"] = page_num
 
-        if not header_chunks:
-            for c in char_splitter.split_documents([doc]):
-                merged = {**parent_meta, **c.metadata}
-                merged.setdefault("section", "")
-                c.metadata = merged
-                all_chunks.append(c)
-            continue
+            header_chunks = header_splitter.split_text(page_md)
 
-        for hc in header_chunks:
-            section_parts = [
-                hc.metadata[k] for k in ("h1", "h2", "h3", "h4") if hc.metadata.get(k)
-            ]
-            section = " > ".join(section_parts)
-
-            base_meta = {**parent_meta, "section": section, **hc.metadata}
-
-            if len(hc.page_content) <= CHUNK_SIZE:
-                all_chunks.append(
-                    Document(page_content=hc.page_content, metadata=base_meta)
-                )
+            if not header_chunks:
+                page_doc = Document(page_content=page_md, metadata=page_meta)
+                for c in char_splitter.split_documents([page_doc]):
+                    merged = {**page_meta, **c.metadata}
+                    merged.setdefault("section", "")
+                    c.metadata = merged
+                    all_chunks.append(c)
                 continue
 
-            sub_docs = char_splitter.split_documents(
-                [Document(page_content=hc.page_content, metadata=base_meta)]
-            )
-            for sd in sub_docs:
-                merged = {**base_meta, **sd.metadata}
-                sd.metadata = merged
-                all_chunks.append(sd)
+            for hc in header_chunks:
+                section_parts = [
+                    hc.metadata[k]
+                    for k in ("h1", "h2", "h3", "h4")
+                    if hc.metadata.get(k)
+                ]
+                section = " > ".join(section_parts)
+                base_meta = {**page_meta, "section": section, **hc.metadata}
+
+                if len(hc.page_content) <= CHUNK_SIZE:
+                    all_chunks.append(
+                        Document(page_content=hc.page_content, metadata=base_meta)
+                    )
+                    continue
+
+                sub_docs = char_splitter.split_documents(
+                    [Document(page_content=hc.page_content, metadata=base_meta)]
+                )
+                for sd in sub_docs:
+                    merged = {**base_meta, **sd.metadata}
+                    sd.metadata = merged
+                    all_chunks.append(sd)
 
     return all_chunks
 

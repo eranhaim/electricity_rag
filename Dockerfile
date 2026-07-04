@@ -17,6 +17,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY backend/ ./backend/
+COPY scripts/ ./scripts/
 COPY --from=frontend-build /app/frontend/dist ./frontend/dist
 
 RUN mkdir -p data/uploads data/processed data/vectorstore
