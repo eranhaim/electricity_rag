@@ -185,8 +185,9 @@ def _split_markdown_documents(documents: list[Document]) -> list[Document]:
         2. Any header section that is still larger than ``CHUNK_SIZE`` is
            further split by ``RecursiveCharacterTextSplitter`` while keeping
            the parent header metadata intact.
-    Documents that contain no Markdown headers fall through to plain
-    character splitting.
+    Documents that contain no Markdown headers (e.g. PDF pages extracted by
+    PyPDFLoader) fall through to plain character splitting while preserving
+    the original metadata (including ``page`` for PDFs).
     """
     header_splitter = MarkdownHeaderTextSplitter(
         headers_to_split_on=_HEADER_LEVELS,
@@ -202,13 +203,15 @@ def _split_markdown_documents(documents: list[Document]) -> list[Document]:
     all_chunks: list[Document] = []
     for doc in documents:
         source = doc.metadata.get("source", "unknown")
+        parent_meta = dict(doc.metadata)
 
         header_chunks = header_splitter.split_text(doc.page_content)
 
         if not header_chunks:
             for c in char_splitter.split_documents([doc]):
-                c.metadata["source"] = source
-                c.metadata["section"] = ""
+                merged = {**parent_meta, **c.metadata}
+                merged.setdefault("section", "")
+                c.metadata = merged
                 all_chunks.append(c)
             continue
 
@@ -218,7 +221,7 @@ def _split_markdown_documents(documents: list[Document]) -> list[Document]:
             ]
             section = " > ".join(section_parts)
 
-            base_meta = {"source": source, "section": section, **hc.metadata}
+            base_meta = {**parent_meta, "section": section, **hc.metadata}
 
             if len(hc.page_content) <= CHUNK_SIZE:
                 all_chunks.append(
@@ -230,7 +233,8 @@ def _split_markdown_documents(documents: list[Document]) -> list[Document]:
                 [Document(page_content=hc.page_content, metadata=base_meta)]
             )
             for sd in sub_docs:
-                sd.metadata.update(base_meta)
+                merged = {**base_meta, **sd.metadata}
+                sd.metadata = merged
                 all_chunks.append(sd)
 
     return all_chunks
@@ -305,15 +309,22 @@ def _format_context(docs: list[Document]) -> str:
     Each chunk header exposes:
       - source: original filename (so the LLM can cite it)
       - section: the Markdown header path (e.g. "פרק ב > תקנה 17") when
-        available — this is what enables regulation-number citations.
+        available — this enables regulation-number citations.
+      - page: 1-based page number for PDF chunks.
     """
     lines: list[str] = []
     for i, d in enumerate(docs, start=1):
         src = d.metadata.get("source", "unknown")
-        section = d.metadata.get("section") or "(no section)"
-        lines.append(
-            f"[chunk {i} | source: {src} | section: {section}]\n{d.page_content}"
-        )
+        section = d.metadata.get("section") or ""
+        page = d.metadata.get("page")
+
+        header_parts = [f"chunk {i}", f"source: {src}"]
+        if section:
+            header_parts.append(f"section: {section}")
+        if page is not None:
+            header_parts.append(f"page: {page}")
+
+        lines.append("[" + " | ".join(header_parts) + "]\n" + d.page_content)
     return "\n\n---\n\n".join(lines)
 
 
@@ -388,11 +399,18 @@ async def ask(question: str, session_messages: list[dict] | None = None) -> dict
     for d in docs:
         src = d.metadata.get("source", "unknown")
         section = d.metadata.get("section") or ""
-        key = (src, section)
+        page = d.metadata.get("page")
+        key = (src, section, page)
         if key in seen_pairs:
             continue
         seen_pairs.add(key)
-        sources.append(f"{src} — {section}" if section else src)
+
+        label = src
+        if section:
+            label += f" — {section}"
+        elif page is not None:
+            label += f" (p.{page})"
+        sources.append(label)
 
     return {"answer": response.content, "sources": sources}
 
