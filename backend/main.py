@@ -142,12 +142,41 @@ def api_delete_file(filename: str):
         raise HTTPException(404, "File not found")
     upload_path.unlink()
 
-    processed_name = Path(filename).stem + "_optimized.txt"
-    processed_path = UPLOADS_DIR.parent / "processed" / processed_name
-    processed_path.unlink(missing_ok=True)
+    processed_dir = UPLOADS_DIR.parent / "processed"
+    stem = Path(filename).stem
+    for candidate in [
+        processed_dir / f"{stem}.txt",
+        processed_dir / f"{stem}_optimized.txt",
+    ]:
+        candidate.unlink(missing_ok=True)
 
-    rebuild_vectorstore()
-    return {"ok": True}
+    chunk_count = rebuild_vectorstore()
+    return {"ok": True, "chunks_indexed": chunk_count}
+
+
+@app.post("/api/admin/reindex", dependencies=[Depends(verify_admin)])
+async def api_reindex():
+    """Re-process every file in ``data/uploads`` and rebuild the FAISS index
+    from the raw content. Use this after upgrading the pipeline or if the
+    processed/vectorstore artifacts get out of sync with the uploads."""
+    upload_files = [
+        f for f in UPLOADS_DIR.iterdir()
+        if f.is_file() and f.name != ".gitkeep"
+    ]
+    errors: list[str] = []
+    for f in upload_files:
+        try:
+            await process_file(f)
+        except Exception as e:  # noqa: BLE001
+            errors.append(f"{f.name}: {e}")
+
+    chunk_count = rebuild_vectorstore()
+    return {
+        "ok": True,
+        "files_processed": len(upload_files) - len(errors),
+        "chunks_indexed": chunk_count,
+        "errors": errors,
+    }
 
 
 @app.get("/api/admin/status", dependencies=[Depends(verify_admin)])

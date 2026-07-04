@@ -1,93 +1,150 @@
 """
-Extracts text from uploaded files and sends it to a high-end LLM
-to produce a RAG-optimized text file.
+File processor for the Electricity RAG.
+
+Extracts text from uploaded documents into LangChain ``Document`` objects
+WITHOUT any LLM rewriting. Preserving the original text (Hebrew or otherwise)
+is essential — an earlier "LLM optimization" step was translating Hebrew into
+English and corrupting regulation numbers/values, which caused retrieval to
+miss the actual content.
+
+Each document is enriched with metadata:
+    - source: original filename
+    - page:   1-based page number (PDFs) or logical section (other formats)
+
+A plain-text debug artifact is also written to ``data/processed/<name>.txt``
+so a human can inspect exactly what the retriever will see.
 """
-import os
+
+from __future__ import annotations
+
 from pathlib import Path
 
-from langchain_openai import ChatOpenAI
-from langchain.schema import HumanMessage, SystemMessage
+from langchain.schema import Document
 
-from backend.config import OPENAI_API_KEY, UPLOADS_DIR, PROCESSED_DIR
-
-os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
-
-RAG_OPTIMIZATION_PROMPT = """You are a document processing expert. Your task is to take raw text extracted from documents about electricity and power systems and produce a clean, well-structured, RAG-optimized version.
-
-Instructions:
-1. Remove all formatting artifacts, headers/footers, page numbers, and noise.
-2. Organize the content into clear, self-contained sections with descriptive headings.
-3. Each section should be a coherent chunk that can stand alone when retrieved.
-4. Preserve all factual information, numbers, formulas, standards, and technical details exactly.
-5. Expand abbreviations on first use.
-6. Add brief context at the start of each section so a reader understands the topic without needing surrounding text.
-7. Use clear, concise language. Remove redundancy but keep completeness.
-8. If there are tables, convert them into readable text or structured lists.
-9. Output plain text only (no markdown formatting).
-
-Process the following document text:"""
+from backend.config import PROCESSED_DIR
 
 
-def _extract_text(file_path: Path) -> str:
+def _load_pdf(file_path: Path) -> list[Document]:
+    """Extract one Document per PDF page using PyPDFLoader (LangChain wrapper
+    around pypdf). PyPDFLoader preserves per-page structure, unicode Hebrew,
+    and does not modify the content."""
+    from langchain_community.document_loaders import PyPDFLoader
+
+    loader = PyPDFLoader(str(file_path))
+    raw_docs = loader.load()
+
+    docs: list[Document] = []
+    for i, d in enumerate(raw_docs):
+        text = (d.page_content or "").strip()
+        if not text:
+            continue
+        docs.append(
+            Document(
+                page_content=text,
+                metadata={
+                    "source": file_path.name,
+                    "page": i + 1,
+                    "total_pages": len(raw_docs),
+                },
+            )
+        )
+    return docs
+
+
+def _load_docx(file_path: Path) -> list[Document]:
+    from docx import Document as DocxDocument
+
+    doc = DocxDocument(str(file_path))
+    paragraphs = [p.text for p in doc.paragraphs if p.text and p.text.strip()]
+    full_text = "\n".join(paragraphs)
+    if not full_text.strip():
+        return []
+    return [
+        Document(
+            page_content=full_text,
+            metadata={"source": file_path.name, "page": 1},
+        )
+    ]
+
+
+def _load_txt(file_path: Path) -> list[Document]:
+    text = file_path.read_text(encoding="utf-8", errors="ignore")
+    if not text.strip():
+        return []
+    return [
+        Document(
+            page_content=text,
+            metadata={"source": file_path.name, "page": 1},
+        )
+    ]
+
+
+def _load_xlsx(file_path: Path) -> list[Document]:
+    import openpyxl
+
+    wb = openpyxl.load_workbook(str(file_path), data_only=True)
+    docs: list[Document] = []
+    for sheet_name in wb.sheetnames:
+        ws = wb[sheet_name]
+        lines = [f"Sheet: {sheet_name}"]
+        for row in ws.iter_rows(values_only=True):
+            lines.append("\t".join(str(c) if c is not None else "" for c in row))
+        text = "\n".join(lines).strip()
+        if text:
+            docs.append(
+                Document(
+                    page_content=text,
+                    metadata={"source": file_path.name, "sheet": sheet_name},
+                )
+            )
+    return docs
+
+
+def _load_csv(file_path: Path) -> list[Document]:
+    return _load_txt(file_path)
+
+
+def load_file_documents(file_path: Path) -> list[Document]:
+    """Dispatch to the right loader based on file extension.
+
+    Returns a list of Documents preserving the ORIGINAL text and adding
+    ``source`` + ``page`` metadata. NEVER translates or paraphrases content.
+    """
     suffix = file_path.suffix.lower()
 
-    if suffix == ".txt":
-        return file_path.read_text(encoding="utf-8", errors="ignore")
-
     if suffix == ".pdf":
-        from pypdf import PdfReader
-        reader = PdfReader(str(file_path))
-        return "\n".join(page.extract_text() or "" for page in reader.pages)
-
+        return _load_pdf(file_path)
     if suffix == ".docx":
-        from docx import Document
-        doc = Document(str(file_path))
-        return "\n".join(p.text for p in doc.paragraphs)
-
+        return _load_docx(file_path)
     if suffix in (".xlsx", ".xls"):
-        import openpyxl
-        wb = openpyxl.load_workbook(str(file_path), data_only=True)
-        lines = []
-        for sheet in wb.sheetnames:
-            ws = wb[sheet]
-            lines.append(f"Sheet: {sheet}")
-            for row in ws.iter_rows(values_only=True):
-                lines.append("\t".join(str(c) if c is not None else "" for c in row))
-        return "\n".join(lines)
-
+        return _load_xlsx(file_path)
     if suffix == ".csv":
-        return file_path.read_text(encoding="utf-8", errors="ignore")
+        return _load_csv(file_path)
+    return _load_txt(file_path)
 
-    return file_path.read_text(encoding="utf-8", errors="ignore")
+
+def _write_debug_text(file_path: Path, docs: list[Document]) -> Path:
+    """Write a human-readable plain-text artifact for transparency/debugging.
+    The vector store is built from the Document objects directly — this file
+    is NOT used for retrieval."""
+    output_path = PROCESSED_DIR / (file_path.stem + ".txt")
+    parts: list[str] = []
+    for d in docs:
+        page = d.metadata.get("page", d.metadata.get("sheet", "?"))
+        parts.append(f"--- {file_path.name} | page/section {page} ---\n{d.page_content}")
+    output_path.write_text("\n\n".join(parts), encoding="utf-8")
+    return output_path
 
 
 async def process_file(file_path: Path) -> Path:
-    """Extract text from a file, optimize it via LLM, save the result, and return the output path."""
-    raw_text = _extract_text(file_path)
+    """Extract text from a file into Documents (no LLM rewriting), write a
+    debug ``.txt`` artifact, and return the artifact path.
 
-    if not raw_text.strip():
-        raise ValueError(f"No text could be extracted from {file_path.name}")
-
-    MAX_CHARS = 100_000
-    if len(raw_text) > MAX_CHARS:
-        chunks = [raw_text[i:i + MAX_CHARS] for i in range(0, len(raw_text), MAX_CHARS)]
-    else:
-        chunks = [raw_text]
-
-    llm = ChatOpenAI(model="gpt-4o", temperature=0.1, max_tokens=16000)
-
-    optimized_parts = []
-    for i, chunk in enumerate(chunks):
-        messages = [
-            SystemMessage(content=RAG_OPTIMIZATION_PROMPT),
-            HumanMessage(content=chunk),
-        ]
-        response = await llm.ainvoke(messages)
-        optimized_parts.append(response.content)
-
-    optimized_text = "\n\n".join(optimized_parts)
-    output_name = file_path.stem + "_optimized.txt"
-    output_path = PROCESSED_DIR / output_name
-    output_path.write_text(optimized_text, encoding="utf-8")
-
-    return output_path
+    The actual retrieval index is (re)built from the raw Documents by
+    ``rag_pipeline.rebuild_vectorstore()``, which is called after this
+    function by the upload handler.
+    """
+    docs = load_file_documents(file_path)
+    if not docs:
+        raise ValueError(f"No extractable text in {file_path.name}")
+    return _write_debug_text(file_path, docs)
